@@ -52,6 +52,29 @@ from ..tensor.quantized_tensor import (
 
 __all__ = ["GroupedLinear"]
 
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+def fake_int4_quantization(x, block_size):
+    m, n = x.shape
+    block_size_m, block_size_n = block_size[0], block_size[1]
+    x_padded = torch.zeros(
+        (ceil_div(m, block_size_m) * block_size_m,
+         ceil_div(n, block_size_n) * block_size_n),
+        dtype=x.dtype, device=x.device
+    )
+    x_padded[:m, :n] = x
+    x_view = x_padded.view(-1, block_size_m, x_padded.size(1) // block_size_n, block_size_n)
+
+    x_max = x_view.abs().float().amax(dim=(1,3), keepdim=True)
+    q_max = 7
+
+    x_scale = x_max / q_max
+    x_scale.view(x_view.size(0), x_view.size(2)).clamp(1e-5)
+
+    x_q = torch.round(x_view / x_scale).to(torch.float)
+    x_ref = x_q * x_scale
+    return x_ref.view_as(x_padded)[:m, :n].contiguous().to(x.dtype)
 
 class _GroupedLinear(torch.autograd.Function):
     """GroupedLinear semi-top level module
@@ -146,6 +169,7 @@ class _GroupedLinear(torch.autograd.Function):
 
         else:
             weights_fp8 = [cast_if_needed(weight, activation_dtype) for weight in weights]
+            weights_fp8 = [fake_int4_quantization(weight, [1, 32]) for weight in weights]
 
         # Initialize biases
         bias_dtype = activation_dtype
