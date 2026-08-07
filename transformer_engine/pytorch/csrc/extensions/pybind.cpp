@@ -548,12 +548,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &transformer_engine::pytorch::nvfp4_per_token_group_quantize,
         "Grouped (multi-tensor) NVFP4 per-token cast: K1 + K2 across <= 64 splits "
         "of a single (sum_M, K) input. Byte-equal to a for-loop of single-tensor. "
-        "with_rht=True applies a 16-pt col-wise RHT in both K1 and K2.",
+        "with_rht=True applies a 16-pt col-wise RHT in both K1 and K2. "
+        "with_swizzle=True writes rowwise scale_inv directly in the swizzled layout.",
         py::arg("input"), py::arg("split_sections"), py::arg("q_row_list"),
         py::arg("s_dec_row_list"), py::arg("row_amax_list"), py::arg("q_col_list"),
         py::arg("s_dec_col_list"), py::arg("col_amax_list"), py::arg("rowwise"),
         py::arg("columnwise"), py::arg("with_rht") = false,
-        py::arg("random_sign_mask_t") = static_cast<int64_t>(0xACE1));
+        py::arg("random_sign_mask_t") = static_cast<int64_t>(0xACE1),
+        py::arg("with_swizzle") = false);
   m.def("nvfp4_per_token_group_amax", &transformer_engine::pytorch::nvfp4_per_token_group_amax,
         "K1-only variant of nvfp4_per_token_group_quantize: only fills amax slots. "
         "with_rht / random_sign_mask_t must match the trailing cast launch.",
@@ -564,9 +566,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &transformer_engine::pytorch::nvfp4_per_token_group_quantize_bulk,
         "Bulk grouped quantize: allocates per-split buffers + view-slices inside "
         "the binding (one pybind hop instead of 1 + 6N), then dispatches the K1+K2 "
-        "kernel. with_rht=True applies a 16-pt col-wise RHT in both K1 and K2.",
+        "kernel. with_rht=True applies a 16-pt col-wise RHT in both K1 and K2. "
+        "with_swizzle=True writes rowwise scale_inv directly in the swizzled layout.",
         py::arg("input"), py::arg("split_sections"), py::arg("rowwise"), py::arg("columnwise"),
-        py::arg("with_rht") = false, py::arg("random_sign_mask_t") = static_cast<int64_t>(0xACE1));
+        py::arg("with_rht") = false, py::arg("random_sign_mask_t") = static_cast<int64_t>(0xACE1),
+        py::arg("with_swizzle") = false);
   m.def("fused_multi_row_padding", &transformer_engine::pytorch::fused_multi_row_padding,
         "Fused Multi-tensor padding", py::call_guard<py::gil_scoped_release>());
   m.def("fused_multi_row_unpadding", &transformer_engine::pytorch::fused_multi_row_unpadding,

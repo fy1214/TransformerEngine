@@ -589,3 +589,109 @@ def test_group_k1_amax_matches_single_tensor_per_split_under_rht(
         torch.testing.assert_close(
             ca_g, ca_s, rtol=0.0, atol=0.0, msg=f"split[{i}] col_amax mismatch (K1 only)"
         )
+
+
+# =============================================================================
+# Fused-swizzle: grouped K2 with_swizzle=True emits rowwise SF in cuBLAS LT
+# layout. Must match compact + nvfp4_per_token_swizzle_rowwise_sf (or the
+# single-tensor Python permutation reference) per split.
+# =============================================================================
+
+_SWIZZLE_GROUP_SHAPES: List[Tuple[List[int], int]] = [
+    ([128], 128),
+    ([128, 128], 256),
+    ([128, 256], 512),
+    ([256, 128, 128], 256),
+]
+
+
+def _swizzle_sf_reference(sf_m_major: torch.Tensor) -> torch.Tensor:
+    """M-major (M, K_SF) e4m3 -> cuBLAS LT swizzled flat bytes."""
+    M, K_SF = sf_m_major.shape
+    assert M % 128 == 0
+    assert K_SF % 4 == 0
+    device = sf_m_major.device
+    sf_u8 = sf_m_major.contiguous().view(torch.uint8)
+    out = torch.empty(M * K_SF, dtype=torch.uint8, device=device)
+
+    m_idx = torch.arange(M, device=device, dtype=torch.int64).view(M, 1).expand(M, K_SF)
+    k_idx = torch.arange(K_SF, device=device, dtype=torch.int64).view(1, K_SF).expand(M, K_SF)
+    m_tile = m_idx // 128
+    k_tile = k_idx // 4
+    out_idx = (
+        m_tile * 128 * K_SF
+        + k_tile * 512
+        + (m_idx % 32) * 16
+        + ((m_idx % 128) // 32) * 4
+        + (k_idx % 4)
+    )
+    out[out_idx.reshape(-1)] = sf_u8.reshape(-1)
+    return out
+
+
+@_GATED_FP4
+@pytest.mark.parametrize("splits,K", _SWIZZLE_GROUP_SHAPES)
+def test_group_with_swizzle_sf_byte_equal_to_compact_plus_swizzle(
+    splits: List[int],
+    K: int,
+) -> None:
+    """Grouped with_swizzle=True rowwise SF == compact + reference permutation."""
+    torch.manual_seed(0x5F12 * (sum(splits) + 11) + K)
+    device = torch.device("cuda")
+    sum_M = sum(splits)
+    x = torch.randn((sum_M, K), dtype=torch.bfloat16, device=device).contiguous()
+
+    outs_plain = nvfp4_per_token_group_quantize(
+        x, splits, rowwise=True, columnwise=True, with_swizzle=False
+    )
+    outs_swz = nvfp4_per_token_group_quantize(
+        x, splits, rowwise=True, columnwise=True, with_swizzle=True
+    )
+
+    assert len(outs_plain) == len(outs_swz) == len(splits)
+    for i, (plain, swz) in enumerate(zip(outs_plain, outs_swz)):
+        ref = _swizzle_sf_reference(plain.scale.view(torch.uint8))
+        got = swz.scale.view(torch.uint8).reshape(-1)
+        torch.testing.assert_close(
+            got,
+            ref,
+            rtol=0,
+            atol=0,
+            msg=f"split[{i}] fused-swizzle rowwise SF mismatch at K={K}, splits={splits}",
+        )
+        # Ext-swizzle path must agree with the same reference.
+        sf_ext = torch.empty_like(plain.scale.view(torch.uint8).reshape(-1))
+        tex.nvfp4_per_token_swizzle_rowwise_sf(
+            plain.data.view(torch.uint8), plain.scale.view(torch.uint8).reshape(-1), sf_ext
+        )
+        torch.testing.assert_close(
+            got,
+            sf_ext,
+            rtol=0,
+            atol=0,
+            msg=f"split[{i}] fused vs nvfp4_per_token_swizzle_rowwise_sf mismatch",
+        )
+
+
+@_GATED_FP4
+@pytest.mark.parametrize("splits,K", _SWIZZLE_GROUP_SHAPES[:2])
+def test_group_with_swizzle_other_outputs_unchanged(splits: List[int], K: int) -> None:
+    """Only rowwise scale_inv layout differs under with_swizzle."""
+    torch.manual_seed(0xA11CE * (sum(splits) + 5) + K)
+    device = torch.device("cuda")
+    sum_M = sum(splits)
+    x = torch.randn((sum_M, K), dtype=torch.bfloat16, device=device).contiguous()
+
+    outs_plain = nvfp4_per_token_group_quantize(
+        x, splits, rowwise=True, columnwise=True, with_swizzle=False
+    )
+    outs_swz = nvfp4_per_token_group_quantize(
+        x, splits, rowwise=True, columnwise=True, with_swizzle=True
+    )
+
+    for i, (plain, swz) in enumerate(zip(outs_plain, outs_swz)):
+        for attr in ("data", "row_amax", "columnwise_data", "columnwise_scale", "col_amax"):
+            ta, tb = getattr(plain, attr), getattr(swz, attr)
+            assert torch.equal(ta.view(torch.uint8), tb.view(torch.uint8)), (
+                f"split[{i}].{attr} changed under with_swizzle at K={K}, splits={splits}"
+            )

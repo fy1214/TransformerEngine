@@ -551,12 +551,13 @@ void nvfp4_per_tensor_gemm(const at::Tensor &a_data, const at::Tensor &b_data,
 
 // with_rht=true applies a 16-pt RHT on the col direction in BOTH K1 and K2;
 // random_sign_mask_t low 16 bits = sign pattern (ignored when with_rht=false).
+// with_swizzle=true makes K2 write rowwise scale_inv in the cuBLAS LT layout.
 void nvfp4_per_token_group_quantize(
     const at::Tensor &input, const std::vector<int64_t> &split_sections,
     std::vector<at::Tensor> q_row_list, std::vector<at::Tensor> s_dec_row_list,
     std::vector<at::Tensor> row_amax_list, std::vector<at::Tensor> q_col_list,
     std::vector<at::Tensor> s_dec_col_list, std::vector<at::Tensor> col_amax_list, bool rowwise,
-    bool columnwise, bool with_rht, int64_t random_sign_mask_t);
+    bool columnwise, bool with_rht, int64_t random_sign_mask_t, bool with_swizzle);
 
 // Amax-only variant of the grouped quantize. Useful for multi-rank training
 // where amax is allReduced before the cast pass. Caller must thread the
@@ -569,11 +570,13 @@ void nvfp4_per_token_group_amax(const at::Tensor &input, const std::vector<int64
 // Bulk grouped quantize: allocate-view-dispatch all in one pybind hop.
 // Returns 6 per-split vectors (q_row, s_dec_row_fp8, row_amax, q_col,
 // s_dec_col_fp8, col_amax); disabled directions return empty vectors.
+// with_swizzle=true writes rowwise scale_inv directly in the swizzled layout.
 std::tuple<std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Tensor>,
            std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Tensor>>
 nvfp4_per_token_group_quantize_bulk(const at::Tensor &input,
                                     const std::vector<int64_t> &split_sections, bool rowwise,
-                                    bool columnwise, bool with_rht, int64_t random_sign_mask_t);
+                                    bool columnwise, bool with_rht, int64_t random_sign_mask_t,
+                                    bool with_swizzle);
 
 /***************************************************************************************************
  * Rotary positional embedding

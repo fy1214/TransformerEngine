@@ -1662,8 +1662,8 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
       nvte_group_nvfp4_per_token_quantize(
           input.data(), handles.data(), split_sections.data(), num_tensors, quantizer.rowwise_usage,
           quantizer.columnwise_usage, quantizer.with_rht ? 1 : 0,
-          quantizer.rht_matrix_random_sign_mask_t, need_stochastic_rounding ? 1 : 0,
-          rng_state_handle, stream);
+          quantizer.rht_matrix_random_sign_mask_t,
+          /*with_swizzle=*/0, need_stochastic_rounding ? 1 : 0, rng_state_handle, stream);
     });
     return;
   }

@@ -596,7 +596,9 @@ __device__ __forceinline__ void colwise_scaling_per_token(
 // FP4 + SFs to per-tensor outputs via st.global (multi-dest, no TMA store).
 // kWithRht=true (and DO_COL=true): col-wise FHT with random_sign_mask_t,
 // matching the K1 amax launch. Row direction never sees RHT.
-template <bool DO_ROW, bool DO_COL, bool kWithRht, bool kWithSr>
+// kWithSwizzle=true: rowwise SF emitted directly in cuBLAS LT 128x4 tile layout
+// (colwise SF stays compact, matching the single-tensor per-token path).
+template <bool DO_ROW, bool DO_COL, bool kWithRht, bool kWithSwizzle, bool kWithSr>
 __global__ void __launch_bounds__(THREADS_NUM)
     group_per_token_fused_cast_kernel(const __grid_constant__ CUtensorMap tensor_map_input,
                                       const __grid_constant__ NVFP4PerTokenMultiArgs args,
@@ -811,15 +813,40 @@ __global__ void __launch_bounds__(THREADS_NUM)
   }
 
   // SF epilogue: cooperative store of sSFrowwise / sSFcolwise to global.
+  // kWithSwizzle=false: compact M-major (downstream nvte_swizzle_scaling_factors).
+  // kWithSwizzle=true: emit cuBLAS LT 128Mx4K tile layout directly; M_tile_idx
+  // is local to the group (not global ctaid_Y) because each split has its own
+  // scale_inv buffer.
   if (DO_ROW) {
     auto& sSFrowwise = *reinterpret_cast<ScalesType2D*>(sSFrowwise_ptr);
-    using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_X>;
-    const size_t scales_block_offset_X_rowwise = static_cast<size_t>(ctaid_X) * SCALES_PER_CHUNK_X;
-    for (int row = static_cast<int>(threadIdx.x); row < CHUNK_DIM_Y; row += THREADS_NUM) {
-      ScalesVec& scales_vec = *reinterpret_cast<ScalesVec*>(sSFrowwise[row]);
-      const size_t local_row = static_cast<size_t>(local_row_base) + row;
-      const size_t scale_idx_global = local_row * scale_stride_row + scales_block_offset_X_rowwise;
-      scales_vec.store_to_elts(&s_dec_row_base[scale_idx_global], 0, SCALES_PER_CHUNK_X);
+    if constexpr (kWithSwizzle) {
+      static_assert(SCALES_PER_CHUNK_X == 8,
+                    "fused-swizzle rowwise scatter assumes SCALES_PER_CHUNK_X == 8");
+      const int tid = threadIdx.x;
+      const int b = tid & 3;       // M-stripe [0, 4), fast axis -> coalesced gmem
+      const int ty = tid >> 2;     // slot index within K-tile [0, 32)
+      const int lm = b * 32 + ty;  // [0, 128)
+      const size_t M_tile_idx = static_cast<size_t>(local_row_base) / CHUNK_DIM_Y;
+      const size_t K_tile_global_base = static_cast<size_t>(ctaid_X) * (SCALES_PER_CHUNK_X / 4);
+
+      const uint64_t packed_all = *reinterpret_cast<const uint64_t*>(&sSFrowwise[lm][0]);
+      const uint32_t packed_lo = static_cast<uint32_t>(packed_all);
+      const uint32_t packed_hi = static_cast<uint32_t>(packed_all >> 32);
+
+      const size_t base_byte = M_tile_idx * CHUNK_DIM_Y * scale_stride_row +
+                               K_tile_global_base * 512 + static_cast<size_t>(ty) * 16 +
+                               static_cast<size_t>(b) * 4;
+      *reinterpret_cast<uint32_t*>(&s_dec_row_base[base_byte]) = packed_lo;
+      *reinterpret_cast<uint32_t*>(&s_dec_row_base[base_byte + 512]) = packed_hi;
+    } else {
+      using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_X>;
+      const size_t scales_block_offset_X_rowwise = static_cast<size_t>(ctaid_X) * SCALES_PER_CHUNK_X;
+      for (int row = static_cast<int>(threadIdx.x); row < CHUNK_DIM_Y; row += THREADS_NUM) {
+        ScalesVec& scales_vec = *reinterpret_cast<ScalesVec*>(sSFrowwise[row]);
+        const size_t local_row = static_cast<size_t>(local_row_base) + row;
+        const size_t scale_idx_global = local_row * scale_stride_row + scales_block_offset_X_rowwise;
+        scales_vec.store_to_elts(&s_dec_row_base[scale_idx_global], 0, SCALES_PER_CHUNK_X);
+      }
     }
   }
   if (DO_COL) {
@@ -857,12 +884,14 @@ __global__ void __launch_bounds__(THREADS_NUM)
 // with_rht=true applies a 16-pt RHT on the col direction; K1 amax must have
 // used the same flag + mask, else inner SF + FP4 saturate against mismatched
 // data.
+// with_swizzle=true: rowwise SF in cuBLAS LT layout (rowwise-only; collapses
+// to false when !do_row).
 inline void launch_grouped_fused_cast_bf16(const NVFP4PerTokenMultiArgs& args,
                                            const SimpleTensor& input_data, int sum_M, int K,
                                            bool do_row, bool do_col, bool with_rht,
-                                           uint32_t random_sign_mask_t, bool with_sr,
-                                           const size_t* rng_state, const float* noop,
-                                           cudaStream_t stream) {
+                                           uint32_t random_sign_mask_t, bool with_swizzle,
+                                           bool with_sr, const size_t* rng_state,
+                                           const float* noop, cudaStream_t stream) {
   if (!do_row && !do_col) return;
 
   checkCuDriverContext(stream);
@@ -875,41 +904,48 @@ inline void launch_grouped_fused_cast_bf16(const NVFP4PerTokenMultiArgs& args,
   dim3 block(THREADS_NUM, 1, 1);
 
   // Collapse to kWithRht=false when no colwise output is requested.
+  // Collapse to kWithSwizzle=false for colwise-only callers.
   const bool with_rht_effective = with_rht && do_col;
+  const bool with_swizzle_effective = with_swizzle && do_row;
   TRANSFORMER_ENGINE_SWITCH_CONDITION(
       do_row, DO_ROW,
       TRANSFORMER_ENGINE_SWITCH_CONDITION(
           do_col, DO_COL,
           TRANSFORMER_ENGINE_SWITCH_CONDITION(
-              with_rht_effective, kWithRht, TRANSFORMER_ENGINE_SWITCH_CONDITION(with_sr, kWithSr, {
-                constexpr int sz_in = DIVUP_TO_MULTIPLE(
-                    BUFFS_NUM * BUFF_IN_SIZE * sizeof(FusedIType), TMA_SHMEM_ALIGNMENT);
-                constexpr int sz_out_r =
-                    DO_ROW ? DIVUP_TO_MULTIPLE(BUFFS_NUM_OUT * BUFF_OUT_SIZE, TMA_SHMEM_ALIGNMENT)
-                           : 0;
-                constexpr int sz_out_c =
-                    DO_COL ? DIVUP_TO_MULTIPLE(BUFFS_NUM_OUT_TR * BUFF_OUT_TR_SIZE,
-                                               TMA_SHMEM_ALIGNMENT)
-                           : 0;
-                constexpr int sz_sf_r = DO_ROW
-                                            ? DIVUP_TO_MULTIPLE(CHUNK_DIM_Y * SCALES_PER_CHUNK_X *
-                                                                    sizeof(nvfp4_scale_t),
-                                                                TMA_SHMEM_ALIGNMENT)
-                                            : 0;
-                constexpr int sz_sf_c = DO_COL
-                                            ? DIVUP_TO_MULTIPLE(CHUNK_DIM_X * SCALES_PER_CHUNK_Y *
-                                                                    sizeof(nvfp4_scale_t),
-                                                                TMA_SHMEM_ALIGNMENT)
-                                            : 0;
-                constexpr int dshmem_size =
-                    sz_in + sz_out_r + sz_out_c + sz_sf_r + sz_sf_c + TMA_SHMEM_ALIGNMENT;
-                auto kernel = group_per_token_fused_cast_kernel<DO_ROW, DO_COL, kWithRht, kWithSr>;
-                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     dshmem_size);
-                kernel<<<grid, block, dshmem_size, stream>>>(
-                    tmap_in, args, noop, static_cast<size_t>(sum_M), static_cast<size_t>(K),
-                    random_sign_mask_t, rng_state);
-              }))));
+              with_rht_effective, kWithRht,
+              TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                  with_swizzle_effective, kWithSwizzle,
+                  TRANSFORMER_ENGINE_SWITCH_CONDITION(with_sr, kWithSr, {
+                    constexpr int sz_in = DIVUP_TO_MULTIPLE(
+                        BUFFS_NUM * BUFF_IN_SIZE * sizeof(FusedIType), TMA_SHMEM_ALIGNMENT);
+                    constexpr int sz_out_r =
+                        DO_ROW ? DIVUP_TO_MULTIPLE(BUFFS_NUM_OUT * BUFF_OUT_SIZE, TMA_SHMEM_ALIGNMENT)
+                               : 0;
+                    constexpr int sz_out_c =
+                        DO_COL ? DIVUP_TO_MULTIPLE(BUFFS_NUM_OUT_TR * BUFF_OUT_TR_SIZE,
+                                                   TMA_SHMEM_ALIGNMENT)
+                               : 0;
+                    constexpr int sz_sf_r =
+                        DO_ROW ? DIVUP_TO_MULTIPLE(CHUNK_DIM_Y * SCALES_PER_CHUNK_X *
+                                                        sizeof(nvfp4_scale_t),
+                                                    TMA_SHMEM_ALIGNMENT)
+                               : 0;
+                    constexpr int sz_sf_c =
+                        DO_COL ? DIVUP_TO_MULTIPLE(CHUNK_DIM_X * SCALES_PER_CHUNK_Y *
+                                                        sizeof(nvfp4_scale_t),
+                                                    TMA_SHMEM_ALIGNMENT)
+                               : 0;
+                    constexpr int dshmem_size =
+                        sz_in + sz_out_r + sz_out_c + sz_sf_r + sz_sf_c + TMA_SHMEM_ALIGNMENT;
+                    auto kernel =
+                        group_per_token_fused_cast_kernel<DO_ROW, DO_COL, kWithRht, kWithSwizzle,
+                                                          kWithSr>;
+                    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         dshmem_size);
+                    kernel<<<grid, block, dshmem_size, stream>>>(
+                        tmap_in, args, noop, static_cast<size_t>(sum_M), static_cast<size_t>(K),
+                        random_sign_mask_t, rng_state);
+                  })))));
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
@@ -1029,11 +1065,13 @@ void populate_args(NVFP4PerTokenMultiArgs* args, std::vector<Tensor*>& outputs,
 // same flag/mask if they invoke amax + cast separately. with_sr / rng_state
 // only affect the K2 cast (amax stays deterministic); rng_state is a device
 // pointer to {seed, offset} and may be nullptr iff !with_sr.
+// with_swizzle=true: K2 emits rowwise scale_inv in cuBLAS LT layout; caller
+// must set with_gemm_swizzled_scales on the output tensors.
 void quantize_per_token_grouped(const Tensor& input, std::vector<Tensor*>& outputs,
                                 const size_t* split_sections, size_t num_tensors, bool rowwise,
                                 bool columnwise, bool do_amax, bool do_cast, bool with_rht,
-                                uint32_t random_sign_mask_t, bool with_sr, const size_t* rng_state,
-                                cudaStream_t stream) {
+                                uint32_t random_sign_mask_t, bool with_swizzle, bool with_sr,
+                                const size_t* rng_state, cudaStream_t stream) {
   NVTE_CHECK(num_tensors > 0, "NVFP4 per-token grouped: num_tensors must be > 0");
   NVTE_CHECK(num_tensors <= static_cast<size_t>(kMaxTensorsPerKernel),
              "NVFP4 per-token grouped: num_tensors (", num_tensors,
@@ -1049,6 +1087,15 @@ void quantize_per_token_grouped(const Tensor& input, std::vector<Tensor*>& outpu
   const int K = static_cast<int>(input.flat_last_dim());
   if (sum_M == 0 || K == 0) return;
   NVTE_CHECK(K % 128 == 0, "NVFP4 per-token grouped: K (", K, ") must be a multiple of 128");
+
+  if (!with_swizzle) {
+    for (size_t i = 0; i < num_tensors; ++i) {
+      NVTE_CHECK(!outputs[i]->with_gemm_swizzled_scales,
+                 "Per-token grouped cast emits compact (non-swizzled) inner SF unless "
+                 "with_swizzle=true is passed (outputs[",
+                 i, "]).");
+    }
+  }
 
   int which_buffers = 0;
   if ((do_amax || do_cast) && rowwise) which_buffers |= kBufRowAmax;
@@ -1074,6 +1121,7 @@ void quantize_per_token_grouped(const Tensor& input, std::vector<Tensor*>& outpu
                                           /*do_col=*/columnwise,
                                           /*with_rht=*/with_rht,
                                           /*random_sign_mask_t=*/random_sign_mask_t,
+                                          /*with_swizzle=*/with_swizzle,
                                           /*with_sr=*/with_sr,
                                           /*rng_state=*/rng_state,
                                           /*noop=*/nullptr, stream);
@@ -1136,7 +1184,7 @@ void nvte_group_nvfp4_per_token_amax(const NVTETensor input, NVTETensor* outputs
       /*with_rht=*/with_rht != 0,
       /*random_sign_mask_t=*/
       static_cast<uint32_t>(random_sign_mask_t) & 0xFFFFu,
-      /*with_sr=*/false, /*rng_state=*/nullptr, stream);
+      /*with_swizzle=*/false, /*with_sr=*/false, /*rng_state=*/nullptr, stream);
 #else
   (void)input;
   (void)outputs;
@@ -1154,7 +1202,8 @@ void nvte_group_nvfp4_per_token_amax(const NVTETensor input, NVTETensor* outputs
 void nvte_group_nvfp4_per_token_cast(const NVTETensor input, NVTETensor* outputs,
                                      const size_t* split_sections, size_t num_tensors, bool rowwise,
                                      bool columnwise, int with_rht, int random_sign_mask_t,
-                                     int with_sr, const NVTETensor rng_state, cudaStream_t stream) {
+                                     int with_swizzle, int with_sr, const NVTETensor rng_state,
+                                     cudaStream_t stream) {
 #if FP4_TYPE_SUPPORTED
   NVTE_API_CALL(nvte_group_nvfp4_per_token_cast);
   using namespace transformer_engine;
@@ -1168,6 +1217,7 @@ void nvte_group_nvfp4_per_token_cast(const NVTETensor input, NVTETensor* outputs
       /*with_rht=*/with_rht != 0,
       /*random_sign_mask_t=*/
       static_cast<uint32_t>(random_sign_mask_t) & 0xFFFFu,
+      /*with_swizzle=*/with_swizzle != 0,
       /*with_sr=*/with_sr != 0, /*rng_state=*/rng_state_ptr, stream);
 #else
   (void)input;
@@ -1178,6 +1228,7 @@ void nvte_group_nvfp4_per_token_cast(const NVTETensor input, NVTETensor* outputs
   (void)columnwise;
   (void)with_rht;
   (void)random_sign_mask_t;
+  (void)with_swizzle;
   (void)with_sr;
   (void)rng_state;
   (void)stream;
@@ -1188,7 +1239,7 @@ void nvte_group_nvfp4_per_token_cast(const NVTETensor input, NVTETensor* outputs
 void nvte_group_nvfp4_per_token_quantize(const NVTETensor input, NVTETensor* outputs,
                                          const size_t* split_sections, size_t num_tensors,
                                          bool rowwise, bool columnwise, int with_rht,
-                                         int random_sign_mask_t, int with_sr,
+                                         int random_sign_mask_t, int with_swizzle, int with_sr,
                                          const NVTETensor rng_state, cudaStream_t stream) {
 #if FP4_TYPE_SUPPORTED
   NVTE_API_CALL(nvte_group_nvfp4_per_token_quantize);
@@ -1203,6 +1254,7 @@ void nvte_group_nvfp4_per_token_quantize(const NVTETensor input, NVTETensor* out
       /*with_rht=*/with_rht != 0,
       /*random_sign_mask_t=*/
       static_cast<uint32_t>(random_sign_mask_t) & 0xFFFFu,
+      /*with_swizzle=*/with_swizzle != 0,
       /*with_sr=*/with_sr != 0, /*rng_state=*/rng_state_ptr, stream);
 #else
   (void)input;
@@ -1213,6 +1265,7 @@ void nvte_group_nvfp4_per_token_quantize(const NVTETensor input, NVTETensor* out
   (void)columnwise;
   (void)with_rht;
   (void)random_sign_mask_t;
+  (void)with_swizzle;
   (void)with_sr;
   (void)rng_state;
   (void)stream;

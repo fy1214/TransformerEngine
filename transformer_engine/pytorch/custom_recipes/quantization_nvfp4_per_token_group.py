@@ -67,6 +67,7 @@ def nvfp4_per_token_group_quantize(
     columnwise: bool = False,
     with_rht: bool = False,
     random_sign_mask_t: int = _RHT_MASK_DEFAULT,
+    with_swizzle: bool = False,
 ) -> List[RefNVFP4TensorPerToken]:
     """Grouped NVFP4 per-token cast; returns N RefNVFP4TensorPerToken splits.
 
@@ -78,6 +79,8 @@ def nvfp4_per_token_group_quantize(
             downstream GEMM must consume RHT-rotated weights to stay
             unbiased. Rowwise never sees RHT.
         random_sign_mask_t: low 16 bits = sign pattern shared by K1+K2.
+        with_swizzle: True -> emit rowwise scale_inv in cuBLAS LT swizzled
+            layout (GEMM can skip a separate swizzle pass).
 
     Raises ``ValueError`` on shape / dtype / split-size violations.
     """
@@ -105,6 +108,7 @@ def nvfp4_per_token_group_quantize(
         columnwise,
         with_rht=bool(with_rht),
         random_sign_mask_t=int(random_sign_mask_t) & 0xFFFF,
+        with_swizzle=bool(with_swizzle),
     )
 
     outs: List[RefNVFP4TensorPerToken] = []

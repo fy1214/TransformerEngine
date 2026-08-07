@@ -135,6 +135,10 @@ void nvte_group_nvfp4_per_token_amax(const NVTETensor input, NVTETensor* outputs
  *                                colwise cast.
  *  \param[in]     random_sign_mask_t  low 16 bits = sign-flip pattern; must
  *                                match K1.
+ *  \param[in]     with_swizzle   non-zero -> write rowwise scale_inv directly
+ *                                in cuBLAS LT swizzled layout (rowwise-only;
+ *                                ignored when !rowwise). Caller must set
+ *                                with_gemm_swizzled_scales on the outputs.
  *  \param[in]     with_sr        non-zero -> the FP4 cast uses stochastic
  *                                rounding (per-element Philox dither) for BOTH
  *                                row and col directions. The amax (K1) stays
@@ -149,7 +153,8 @@ void nvte_group_nvfp4_per_token_amax(const NVTETensor input, NVTETensor* outputs
 void nvte_group_nvfp4_per_token_cast(const NVTETensor input, NVTETensor* outputs,
                                      const size_t* split_sections, size_t num_tensors, bool rowwise,
                                      bool columnwise, int with_rht, int random_sign_mask_t,
-                                     int with_sr, const NVTETensor rng_state, cudaStream_t stream);
+                                     int with_swizzle, int with_sr, const NVTETensor rng_state,
+                                     cudaStream_t stream);
 
 /*! \brief Composite K1+K2 grouped per-token quantize. Calls the amax + cast
  *         kernels on the same stream. This is the external API
@@ -170,6 +175,10 @@ void nvte_group_nvfp4_per_token_cast(const NVTETensor input, NVTETensor* outputs
  *                                pre-RHT path.
  *  \param[in]     random_sign_mask_t  low 16 bits = sign-flip pattern shared
  *                                between K1 and K2; ignored when with_rht==0.
+ *  \param[in]     with_swizzle   non-zero -> K2 emits rowwise scale_inv
+ *                                directly in cuBLAS LT swizzled layout
+ *                                (rowwise-only). Caller must set
+ *                                with_gemm_swizzled_scales on the outputs.
  *  \param[in]     with_sr        non-zero -> the K2 FP4 cast uses stochastic
  *                                rounding (per-element Philox dither). K1 amax
  *                                stays deterministic. Zero is byte-equal to the
@@ -183,7 +192,7 @@ void nvte_group_nvfp4_per_token_cast(const NVTETensor input, NVTETensor* outputs
 void nvte_group_nvfp4_per_token_quantize(const NVTETensor input, NVTETensor* outputs,
                                          const size_t* split_sections, size_t num_tensors,
                                          bool rowwise, bool columnwise, int with_rht,
-                                         int random_sign_mask_t, int with_sr,
+                                         int random_sign_mask_t, int with_swizzle, int with_sr,
                                          const NVTETensor rng_state, cudaStream_t stream);
 
 #ifdef __cplusplus

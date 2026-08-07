@@ -589,7 +589,7 @@ void nvfp4_per_token_group_quantize(
     std::vector<at::Tensor> q_row_list, std::vector<at::Tensor> s_dec_row_list,
     std::vector<at::Tensor> row_amax_list, std::vector<at::Tensor> q_col_list,
     std::vector<at::Tensor> s_dec_col_list, std::vector<at::Tensor> col_amax_list, bool rowwise,
-    bool columnwise, bool with_rht, int64_t random_sign_mask_t) {
+    bool columnwise, bool with_rht, int64_t random_sign_mask_t, bool with_swizzle) {
   TORCH_CHECK(rowwise || columnwise, "At least one of rowwise/columnwise must be True.");
   TORCH_CHECK(input.is_cuda() && input.is_contiguous(), "input must be a contiguous CUDA tensor");
   TORCH_CHECK(input.dim() == 2, "input must be 2D");
@@ -647,12 +647,13 @@ void nvfp4_per_token_group_quantize(
         rowwise ? s_dec_row_list[i] : empty_dummy, rowwise ? row_amax_list[i] : empty_dummy,
         columnwise ? q_col_list[i] : empty_dummy, columnwise ? s_dec_col_list[i] : empty_dummy,
         columnwise ? col_amax_list[i] : empty_dummy);
+    if (with_swizzle) wrappers.back().set_with_gemm_swizzled_scales(true);
     handles.push_back(wrappers.back().data());
   }
 
   nvte_group_nvfp4_per_token_quantize(in_te.data(), handles.data(), split_sections_sz.data(),
                                       num_tensors, rowwise, columnwise, static_cast<int>(with_rht),
-                                      static_cast<int>(random_sign_mask_t),
+                                      static_cast<int>(random_sign_mask_t), with_swizzle ? 1 : 0,
                                       /*with_sr=*/0, /*rng_state=*/nullptr, stream);
 }
 
@@ -727,7 +728,8 @@ std::tuple<std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Ten
            std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Tensor>>
 nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
                                     const std::vector<int64_t>& split_sections, bool rowwise,
-                                    bool columnwise, bool with_rht, int64_t random_sign_mask_t) {
+                                    bool columnwise, bool with_rht, int64_t random_sign_mask_t,
+                                    bool with_swizzle) {
   // Validation mirrors _validate_per_token_group_input in Python.
   TORCH_CHECK(rowwise || columnwise, "At least one of rowwise/columnwise must be True.");
   TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
@@ -838,12 +840,13 @@ nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
         rowwise ? s_dec_row_u8_list[i] : empty_dummy, rowwise ? row_amax_list[i] : empty_dummy,
         columnwise ? q_col_list[i] : empty_dummy, columnwise ? s_dec_col_u8_list[i] : empty_dummy,
         columnwise ? col_amax_list[i] : empty_dummy);
+    if (with_swizzle) wrappers.back().set_with_gemm_swizzled_scales(true);
     handles.push_back(wrappers.back().data());
   }
 
   nvte_group_nvfp4_per_token_quantize(in_te.data(), handles.data(), split_sections_sz.data(),
                                       num_tensors, rowwise, columnwise, static_cast<int>(with_rht),
-                                      static_cast<int>(random_sign_mask_t),
+                                      static_cast<int>(random_sign_mask_t), with_swizzle ? 1 : 0,
                                       /*with_sr=*/0, /*rng_state=*/nullptr, stream);
 
   return std::make_tuple(std::move(q_row_list), std::move(s_dec_row_fp8_list),
