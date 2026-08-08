@@ -1240,7 +1240,8 @@ void nvte_group_nvfp4_per_token_quantize(const NVTETensor input, NVTETensor* out
                                          const size_t* split_sections, size_t num_tensors,
                                          bool rowwise, bool columnwise, int with_rht,
                                          int random_sign_mask_t, int with_swizzle, int with_sr,
-                                         const NVTETensor rng_state, cudaStream_t stream) {
+                                         const NVTETensor rng_state, int do_amax,
+                                         cudaStream_t stream) {
 #if FP4_TYPE_SUPPORTED
   NVTE_API_CALL(nvte_group_nvfp4_per_token_quantize);
   using namespace transformer_engine;
@@ -1250,7 +1251,7 @@ void nvte_group_nvfp4_per_token_quantize(const NVTETensor input, NVTETensor* out
   const size_t* rng_state_ptr = group_per_token_rng_state_ptr(with_sr, rng_state);
   nvfp4_per_token_group::quantize_per_token_grouped(
       *in, outs, split_sections, num_tensors, rowwise, columnwise,
-      /*do_amax=*/true, /*do_cast=*/true,
+      /*do_amax=*/do_amax != 0, /*do_cast=*/true,
       /*with_rht=*/with_rht != 0,
       /*random_sign_mask_t=*/
       static_cast<uint32_t>(random_sign_mask_t) & 0xFFFFu,
@@ -1268,6 +1269,7 @@ void nvte_group_nvfp4_per_token_quantize(const NVTETensor input, NVTETensor* out
   (void)with_swizzle;
   (void)with_sr;
   (void)rng_state;
+  (void)do_amax;
   (void)stream;
   NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
 #endif

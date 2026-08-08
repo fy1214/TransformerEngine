@@ -216,6 +216,9 @@ def _permute_kernel(
     # In PyTorch, pass the same tensors as output_ptr/permuted_probs_ptr.
     output_buf_ptr,  # pylint: disable=unused-argument
     permuted_probs_buf_ptr,  # pylint: disable=unused-argument
+    # Optional permuted row amax (fp32 bits via int32 atomic_max). Unused when
+    # COMPUTE_ROW_AMAX=False (branch is constexpr-eliminated).
+    row_amax_ptr,
     # sizes
     scale_hidden_dim,
     num_tokens,  # pylint: disable=unused-argument
@@ -243,6 +246,7 @@ def _permute_kernel(
     PERMUTE_PROBS: tl.constexpr,
     PERMUTE_SCALE: tl.constexpr,
     FUSION_PAD: tl.constexpr,
+    COMPUTE_ROW_AMAX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     # Note: When FUSION_PAD=True, output buffers should be pre-zeroed by the caller
@@ -259,6 +263,13 @@ def _permute_kernel(
     src_row = pid_t.to(tl.int64)
     input_off = src_row * stride_input_token + cur_off * stride_input_hidden
     inp = tl.load(input_ptr + input_off, mask=mask)
+    # Tile amax over this hidden chunk; cross-tile merge via atomic_max on dst rows.
+    tile_amax_bits = 0
+    if COMPUTE_ROW_AMAX:
+        abs_tile = tl.where(mask, tl.abs(inp.to(tl.float32)), 0.0)
+        tile_amax = tl.max(abs_tile, axis=0)
+        # Positive fp32 bit-order matches integer order → int32 atomic_max is valid.
+        tile_amax_bits = tile_amax.to(tl.int32, bitcast=True)
     if PERMUTE_SCALE:
         mask_scale = cur_off < scale_hidden_dim
         scale_off = pid_t * stride_scale_token + cur_off * stride_scale_hidden
@@ -297,10 +308,17 @@ def _permute_kernel(
                 # for routing_map padding
                 # dst_row != -1 and prob == 0.0 means that this slot is padded
                 tl.store(output_ptr + output_off, 0.0, mask=mask)
+                if COMPUTE_ROW_AMAX:
+                    # padded row stays at amax 0 (buffer pre-zeroed; no-op atomic)
+                    tl.atomic_max(row_amax_ptr + dst_row, 0)
             else:
                 tl.store(output_ptr + output_off, inp, mask=mask)
+                if COMPUTE_ROW_AMAX:
+                    tl.atomic_max(row_amax_ptr + dst_row, tile_amax_bits)
         else:
             tl.store(output_ptr + output_off, inp, mask=mask)
+            if COMPUTE_ROW_AMAX:
+                tl.atomic_max(row_amax_ptr + dst_row, tile_amax_bits)
 
 
 try:
@@ -589,6 +607,9 @@ def _sort_chunks_by_map_kernel(
     # Aliased to output_ptr in JAX so they point to the same memory.
     # In PyTorch, pass the same tensor as output_ptr.
     output_buf_ptr,  # pylint: disable=unused-argument
+    # Optional permuted row amax (fp32). DCE'd when COMPUTE_ROW_AMAX=False.
+    # COMPUTE_ROW_AMAX=True uses a separate 1D launch (see branch below).
+    row_amax_ptr,
     # strides
     stride_input_token,
     stride_input_hidden,
@@ -602,35 +623,63 @@ def _sort_chunks_by_map_kernel(
     # metas
     hidden_size: tl.constexpr,
     PERMUTE_PROBS: tl.constexpr,
+    COMPUTE_ROW_AMAX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     FORWARD: tl.constexpr,
 ):
-    pid_t = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    if FORWARD:
+    if COMPUTE_ROW_AMAX:
+        # 1D grid (M,): fuse copy + per-dst-row amax without cross-tile atomics.
+        # Host only enables this on forward.
+        pid_t = tl.program_id(0)
         src_row = pid_t.to(tl.int64)
         dst_row = tl.load(row_id_map_ptr + pid_t).to(tl.int64)
+        row_amax = 0.0
+        for pid_h in tl.range(0, tl.cdiv(hidden_size, BLOCK_SIZE)):
+            current_offset = pid_h * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = current_offset < hidden_size
+            input_offsets = src_row * stride_input_token + current_offset * stride_input_hidden
+            output_offsets = dst_row * stride_output_token + current_offset * stride_output_hidden
+            inp = tl.load(input_ptr + input_offsets, mask=mask)
+            tl.store(output_ptr + output_offsets, inp, mask=mask)
+            # abs/max in native dtype, promote the scalar only.
+            abs_tile = tl.where(mask, tl.abs(inp), inp * 0)
+            tile_amax = tl.max(abs_tile, axis=0).to(tl.float32)
+            row_amax = tl.maximum(row_amax, tile_amax)
+            if PERMUTE_PROBS:
+                if pid_h == 0:
+                    prob_off = src_row * stride_probs_token
+                    prob = tl.load(probs_ptr + prob_off)
+                    permuted_prob_off = dst_row * stride_permuted_probs_token
+                    tl.store(permuted_probs_ptr + permuted_prob_off, prob)
+        tl.store(row_amax_ptr + dst_row, row_amax)
     else:
-        src_row = tl.load(row_id_map_ptr + pid_t).to(tl.int64)
-        dst_row = pid_t.to(tl.int64)
-    current_offset = pid_h * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = current_offset < hidden_size
-    input_offsets = src_row * stride_input_token + current_offset * stride_input_hidden
-    output_offsets = dst_row * stride_output_token + current_offset * stride_output_hidden
-    inp = tl.load(input_ptr + input_offsets, mask=mask)
-    tl.store(output_ptr + output_offsets, inp, mask=mask)
-    if PERMUTE_PROBS:
-        if pid_h == 0:
-            prob_off = src_row * stride_probs_token
-            prob = tl.load(probs_ptr + prob_off)
-            permuted_prob_off = dst_row * stride_permuted_probs_token
-            tl.store(permuted_probs_ptr + permuted_prob_off, prob)
+        # Original kernel body (2D grid). Keep this path unmodified.
+        pid_t = tl.program_id(0)
+        pid_h = tl.program_id(1)
+        if FORWARD:
+            src_row = pid_t.to(tl.int64)
+            dst_row = tl.load(row_id_map_ptr + pid_t).to(tl.int64)
+        else:
+            src_row = tl.load(row_id_map_ptr + pid_t).to(tl.int64)
+            dst_row = pid_t.to(tl.int64)
+        current_offset = pid_h * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = current_offset < hidden_size
+        input_offsets = src_row * stride_input_token + current_offset * stride_input_hidden
+        output_offsets = dst_row * stride_output_token + current_offset * stride_output_hidden
+        inp = tl.load(input_ptr + input_offsets, mask=mask)
+        tl.store(output_ptr + output_offsets, inp, mask=mask)
+        if PERMUTE_PROBS:
+            if pid_h == 0:
+                prob_off = src_row * stride_probs_token
+                prob = tl.load(probs_ptr + prob_off)
+                permuted_prob_off = dst_row * stride_permuted_probs_token
+                tl.store(permuted_probs_ptr + permuted_prob_off, prob)
 
 
 try:
     _sort_chunks_by_map_kernel = triton.autotune(
         configs=_permutation_autotune_configs(),
-        key=["hidden_size"],
+        key=["hidden_size", "COMPUTE_ROW_AMAX"],
     )(_sort_chunks_by_map_kernel)
 except RuntimeError:
     pass

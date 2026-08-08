@@ -129,6 +129,7 @@ def permute_with_mask_map(
     num_out_tokens: int,
     hidden_size: int,
     scale_hidden_dim: int,
+    compute_row_amax: bool = False,
 ):
     """
     Permute the input tensor based on the row_id_map.
@@ -156,6 +157,9 @@ def permute_with_mask_map(
         Hidden size of the input tensor.
     scale_hidden_dim : int
         Hidden size of the scale tensor.
+    compute_row_amax : bool
+        If True, also compute per-row abs-max of the permuted bf16/fp output into
+        a fp32 buffer of shape ``[num_out_tokens]`` (fused into the permute kernel).
     """
     # Use torch.zeros when pad_offsets is provided to ensure padding regions are zeroed.
     # The kernel writes only to valid positions, leaving padding positions at zero.
@@ -169,6 +173,12 @@ def permute_with_mask_map(
         if scale is not None
         else None
     )
+    # Pre-zero so atomic_max starts from 0; view as int32 for IEEE-positive bit atomic_max.
+    row_amax = None
+    row_amax_i32 = output  # dummy pointer when disabled (DCE'd by constexpr)
+    if compute_row_amax:
+        row_amax = torch.zeros((num_out_tokens,), dtype=torch.float32, device="cuda")
+        row_amax_i32 = row_amax.view(torch.int32)
     # pylint: disable=unnecessary-lambda-assignment
     grid = lambda META: (num_tokens, triton.cdiv(hidden_size, META["BLOCK_SIZE"]))
     _permute_kernel[grid](
@@ -182,6 +192,7 @@ def permute_with_mask_map(
         # In PyTorch, these point to the same memory as the output pointers below.
         output,
         permuted_probs,
+        row_amax_i32,
         scale_hidden_dim,
         num_tokens,
         num_out_tokens,
@@ -205,8 +216,9 @@ def permute_with_mask_map(
         PERMUTE_PROBS=probs is not None,
         PERMUTE_SCALE=scale is not None,
         FUSION_PAD=pad_offsets is not None,
+        COMPUTE_ROW_AMAX=compute_row_amax,
     )
-    return output, permuted_scale, permuted_probs
+    return output, permuted_scale, permuted_probs, row_amax
 
 
 def unpermute_with_mask_map(
@@ -397,6 +409,7 @@ def sort_chunks_by_map(
     num_tokens: int,
     hidden_size: int,
     is_forward: bool,
+    compute_row_amax: bool = False,
 ):
     """
     Sort chunks with row_id_map.
@@ -415,19 +428,36 @@ def sort_chunks_by_map(
         Hidden size of the input tensor.
     is_forward : bool
         Whether the sort is for forward or backward.
+    compute_row_amax : bool
+        If True (forward only), also compute per-dst-row abs-max into a fp32
+        buffer of shape ``[num_tokens]``. Uses a 1D launch that register-reduces
+        amax across hidden tiles (no atomics).
     """
     output = torch.empty((num_tokens, hidden_size), dtype=inp.dtype, device="cuda")
     if probs is not None:
         permuted_probs = torch.empty((num_tokens,), dtype=probs.dtype, device="cuda")
     else:
         permuted_probs = None
+    do_amax = bool(compute_row_amax and is_forward)
+    row_amax = None
+    # Dummy pointer when amax is disabled (constexpr-DCE'd in the kernel).
+    row_amax_buf = output
+    if do_amax:
+        # Every dst row is written exactly once (1D launch) → empty is enough.
+        row_amax = torch.empty((num_tokens,), dtype=torch.float32, device="cuda")
+        row_amax_buf = row_amax
     # pylint: disable=unnecessary-lambda-assignment
-    grid = lambda META: (num_tokens, triton.cdiv(hidden_size, META["BLOCK_SIZE"]))
+    if do_amax:
+        # One program per token; kernel loops over hidden tiles.
+        grid = lambda META: (num_tokens,)
+    else:
+        grid = lambda META: (num_tokens, triton.cdiv(hidden_size, META["BLOCK_SIZE"]))
     _sort_chunks_by_map_kernel[grid](
         inp,
         row_id_map,
         probs,
         output,  # no use in Pytorch side, serves as WAR for JAX side
+        row_amax_buf,
         inp.stride(0),
         inp.stride(1),
         output.stride(0),
@@ -438,6 +468,7 @@ def sort_chunks_by_map(
         permuted_probs,
         hidden_size,
         PERMUTE_PROBS=probs is not None,
+        COMPUTE_ROW_AMAX=do_amax,
         FORWARD=is_forward,
     )
-    return output, permuted_probs
+    return output, permuted_probs, row_amax

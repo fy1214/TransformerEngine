@@ -10,6 +10,7 @@
 
 #include <array>
 #include <mutex>
+#include <optional>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -589,7 +590,7 @@ void nvfp4_per_token_group_quantize(
     std::vector<at::Tensor> q_row_list, std::vector<at::Tensor> s_dec_row_list,
     std::vector<at::Tensor> row_amax_list, std::vector<at::Tensor> q_col_list,
     std::vector<at::Tensor> s_dec_col_list, std::vector<at::Tensor> col_amax_list, bool rowwise,
-    bool columnwise, bool with_rht, int64_t random_sign_mask_t, bool with_swizzle) {
+    bool columnwise, bool with_rht, int64_t random_sign_mask_t, bool with_swizzle, bool do_amax) {
   TORCH_CHECK(rowwise || columnwise, "At least one of rowwise/columnwise must be True.");
   TORCH_CHECK(input.is_cuda() && input.is_contiguous(), "input must be a contiguous CUDA tensor");
   TORCH_CHECK(input.dim() == 2, "input must be 2D");
@@ -654,7 +655,7 @@ void nvfp4_per_token_group_quantize(
   nvte_group_nvfp4_per_token_quantize(in_te.data(), handles.data(), split_sections_sz.data(),
                                       num_tensors, rowwise, columnwise, static_cast<int>(with_rht),
                                       static_cast<int>(random_sign_mask_t), with_swizzle ? 1 : 0,
-                                      /*with_sr=*/0, /*rng_state=*/nullptr, stream);
+                                      /*with_sr=*/0, /*rng_state=*/nullptr, do_amax ? 1 : 0, stream);
 }
 
 // Amax-only grouped variant (K1 only); for allReduce-before-cast flows.
@@ -729,7 +730,9 @@ std::tuple<std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Ten
 nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
                                     const std::vector<int64_t>& split_sections, bool rowwise,
                                     bool columnwise, bool with_rht, int64_t random_sign_mask_t,
-                                    bool with_swizzle) {
+                                    bool with_swizzle, bool do_amax,
+                                    const std::optional<at::Tensor>& row_amax,
+                                    const std::optional<at::Tensor>& col_amax) {
   // Validation mirrors _validate_per_token_group_input in Python.
   TORCH_CHECK(rowwise || columnwise, "At least one of rowwise/columnwise must be True.");
   TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
@@ -772,12 +775,37 @@ nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
   if (rowwise) {
     q_row_bulk = at::empty({sum_M, K / 2}, opts_u8);
     s_dec_row_bulk = at::empty({sum_M, K / kBlockK}, opts_u8);
-    row_amax_bulk = at::empty({sum_M}, opts_f32);
+    if (do_amax) {
+      row_amax_bulk = at::empty({sum_M}, opts_f32);
+    } else {
+      TORCH_CHECK(row_amax.has_value(),
+                  "do_amax=False requires a precomputed row_amax of shape (sum_M,)");
+      row_amax_bulk = row_amax.value();
+      TORCH_CHECK(row_amax_bulk.is_cuda() && row_amax_bulk.is_contiguous(),
+                  "row_amax must be a contiguous CUDA tensor");
+      TORCH_CHECK(row_amax_bulk.scalar_type() == at::ScalarType::Float, "row_amax must be float32");
+      TORCH_CHECK(row_amax_bulk.numel() == sum_M, "row_amax numel mismatch: expected ", sum_M,
+                  ", got ", row_amax_bulk.numel());
+    }
   }
   if (columnwise) {
     q_col_bulk = at::empty({K * sum_M / 2}, opts_u8);
     s_dec_col_bulk = at::empty({K * sum_M / kBlockK}, opts_u8);
-    col_amax_bulk = at::empty({static_cast<int64_t>(num_tensors), K}, opts_f32);
+    if (do_amax) {
+      col_amax_bulk = at::empty({static_cast<int64_t>(num_tensors), K}, opts_f32);
+    } else {
+      TORCH_CHECK(col_amax.has_value(),
+                  "do_amax=False requires a precomputed col_amax of shape (num_tensors, K)");
+      col_amax_bulk = col_amax.value();
+      TORCH_CHECK(col_amax_bulk.is_cuda() && col_amax_bulk.is_contiguous(),
+                  "col_amax must be a contiguous CUDA tensor");
+      TORCH_CHECK(col_amax_bulk.scalar_type() == at::ScalarType::Float, "col_amax must be float32");
+      TORCH_CHECK(col_amax_bulk.dim() == 2 &&
+                      col_amax_bulk.size(0) == static_cast<int64_t>(num_tensors) &&
+                      col_amax_bulk.size(1) == K,
+                  "col_amax shape mismatch: expected (", num_tensors, ", ", K, "), got ",
+                  col_amax_bulk.sizes());
+    }
   }
 
   // Per-split views built in C++; s_dec_* kept in both uint8 (for binding)
@@ -818,7 +846,7 @@ nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
     m_off += M_i;
   }
 
-  // Dispatch K1+K2 grouped kernel via the same C-API the thin entry uses.
+  // Dispatch grouped kernel via the same C-API the thin entry uses.
   const auto stream = at::cuda::getCurrentCUDAStream();
   TensorWrapper in_te = makeTransformerEngineTensor(
       input.data_ptr(), std::vector<size_t>{static_cast<size_t>(sum_M), static_cast<size_t>(K)},
@@ -847,7 +875,7 @@ nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
   nvte_group_nvfp4_per_token_quantize(in_te.data(), handles.data(), split_sections_sz.data(),
                                       num_tensors, rowwise, columnwise, static_cast<int>(with_rht),
                                       static_cast<int>(random_sign_mask_t), with_swizzle ? 1 : 0,
-                                      /*with_sr=*/0, /*rng_state=*/nullptr, stream);
+                                      /*with_sr=*/0, /*rng_state=*/nullptr, do_amax ? 1 : 0, stream);
 
   return std::make_tuple(std::move(q_row_list), std::move(s_dec_row_fp8_list),
                          std::move(row_amax_list), std::move(q_col_list),
