@@ -187,18 +187,13 @@ void nvte_group_nvfp4_per_token_cast(const NVTETensor input, NVTETensor* outputs
  *                                {seed, offset} (host-unpacked Philox); one
  *                                state shared across the whole group. May be
  *                                NULL iff with_sr == 0.
- *  \param[in]     do_amax        non-zero -> run K1 amax before K2 cast (default
- *                                behavior). Zero -> skip K1 and use amax /
- *                                columnwise_amax already populated on outputs
- *                                (e.g. fused into an upstream permute).
  *  \param[in]     stream         CUDA stream
  */
 void nvte_group_nvfp4_per_token_quantize(const NVTETensor input, NVTETensor* outputs,
                                          const size_t* split_sections, size_t num_tensors,
                                          bool rowwise, bool columnwise, int with_rht,
                                          int random_sign_mask_t, int with_swizzle, int with_sr,
-                                         const NVTETensor rng_state, int do_amax,
-                                         cudaStream_t stream);
+                                         const NVTETensor rng_state, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

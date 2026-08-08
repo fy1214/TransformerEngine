@@ -652,10 +652,18 @@ void nvfp4_per_token_group_quantize(
     handles.push_back(wrappers.back().data());
   }
 
-  nvte_group_nvfp4_per_token_quantize(in_te.data(), handles.data(), split_sections_sz.data(),
-                                      num_tensors, rowwise, columnwise, static_cast<int>(with_rht),
-                                      static_cast<int>(random_sign_mask_t), with_swizzle ? 1 : 0,
-                                      /*with_sr=*/0, /*rng_state=*/nullptr, do_amax ? 1 : 0, stream);
+  if (do_amax) {
+    nvte_group_nvfp4_per_token_quantize(in_te.data(), handles.data(), split_sections_sz.data(),
+                                        num_tensors, rowwise, columnwise, static_cast<int>(with_rht),
+                                        static_cast<int>(random_sign_mask_t), with_swizzle ? 1 : 0,
+                                        /*with_sr=*/0, /*rng_state=*/nullptr, stream);
+  } else {
+    // Skip K1: reuse the existing cast-only C API (no public do_amax on quantize).
+    nvte_group_nvfp4_per_token_cast(in_te.data(), handles.data(), split_sections_sz.data(),
+                                    num_tensors, rowwise, columnwise, static_cast<int>(with_rht),
+                                    static_cast<int>(random_sign_mask_t), with_swizzle ? 1 : 0,
+                                    /*with_sr=*/0, /*rng_state=*/nullptr, stream);
+  }
 }
 
 // Amax-only grouped variant (K1 only); for allReduce-before-cast flows.
@@ -872,10 +880,17 @@ nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
     handles.push_back(wrappers.back().data());
   }
 
-  nvte_group_nvfp4_per_token_quantize(in_te.data(), handles.data(), split_sections_sz.data(),
-                                      num_tensors, rowwise, columnwise, static_cast<int>(with_rht),
-                                      static_cast<int>(random_sign_mask_t), with_swizzle ? 1 : 0,
-                                      /*with_sr=*/0, /*rng_state=*/nullptr, do_amax ? 1 : 0, stream);
+  if (do_amax) {
+    nvte_group_nvfp4_per_token_quantize(in_te.data(), handles.data(), split_sections_sz.data(),
+                                        num_tensors, rowwise, columnwise, static_cast<int>(with_rht),
+                                        static_cast<int>(random_sign_mask_t), with_swizzle ? 1 : 0,
+                                        /*with_sr=*/0, /*rng_state=*/nullptr, stream);
+  } else {
+    nvte_group_nvfp4_per_token_cast(in_te.data(), handles.data(), split_sections_sz.data(),
+                                    num_tensors, rowwise, columnwise, static_cast<int>(with_rht),
+                                    static_cast<int>(random_sign_mask_t), with_swizzle ? 1 : 0,
+                                    /*with_sr=*/0, /*rng_state=*/nullptr, stream);
+  }
 
   return std::make_tuple(std::move(q_row_list), std::move(s_dec_row_fp8_list),
                          std::move(row_amax_list), std::move(q_col_list),
