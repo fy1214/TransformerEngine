@@ -8,6 +8,14 @@
  *  \brief Grouped NVFP4 per-token cast: bf16 input (sum_M, K), splits along
  *         M; K1 fused row+col amax + K2 row + col cast. Requires K % 128 == 0
  *         and every split_sections[i] (M_i) % 128 == 0.
+ *
+ *  K1 rowwise opt-in (NVTE_NVFP4_GROUP_CLUSTER_DSMEM=1):
+ *    Auto policy (chunk_x + cluster), unless overridden by
+ *    NVTE_NVFP4_GROUP_AMAX_CHUNK_X={128,256}:
+ *      - 2048 <= K <= 4096 and K%256==0 -> chunk 256 + cluster
+ *      - 256  <= K <= 2048 and K%128==0 -> chunk 128 + cluster
+ *      - else -> chunk 128 + per-CTA atomicMax
+ *    Cast/K2 always uses chunk 128. Colwise forces chunk 128.
  */
 
 #include <cuda.h>
@@ -16,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <transformer_engine/nvfp4_per_token.h>
 
+#include <cooperative_groups.h>
 #include <cstring>
 #include <vector>
 
@@ -23,7 +32,10 @@
 #include "common/cast/nvfp4/core_nvfp4.cuh"
 #include "common/common.h"
 #include "common/util/ptx.cuh"
+#include "common/util/system.h"
 #include "common/utils.cuh"
+
+namespace cg = cooperative_groups;
 
 namespace transformer_engine {
 namespace nvfp4_per_token_group {
@@ -159,13 +171,25 @@ __global__ void group_per_token_fused_zero_amax_kernel(NVFP4PerTokenMultiArgs ar
 
 // kWithRht=true: col-wise amax over RHT-rotated 16-row strips. Row direction
 // never sees RHT.
-template <bool DO_ROW, bool DO_COL, bool kWithRht>
+// Cluster DSMEM row reduce: at most this many CTAs (B200 non-portable).
+constexpr int kMaxClusterCtas = 16;
+
+// kClusterDsmem: RD-gather row partials to leader CTA, local fmax, plain store.
+// kChunkX: 128 (default) or 256 (rowwise-only). DO_COL requires kChunkX==128.
+template <bool DO_ROW, bool DO_COL, bool kWithRht, bool kClusterDsmem = false, int kChunkX = 128>
 __global__ void __launch_bounds__(THREADS_NUM)
     group_per_token_fused_amax_kernel(const __grid_constant__ CUtensorMap tensor_map_input,
                                       const __grid_constant__ NVFP4PerTokenMultiArgs args,
                                       const float* noop, const size_t rows, const size_t cols,
                                       const uint32_t random_sign_mask_t) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static_assert(kChunkX == 128 || kChunkX == 256, "amax kChunkX must be 128 or 256");
+  static_assert(kChunkX % TILE_DIM_X == 0, "kChunkX must be a multiple of TILE_DIM_X");
+  static_assert(!DO_COL || kChunkX == 128, "DO_COL amax only supports kChunkX==128");
+  constexpr int kTilesX = kChunkX / TILE_DIM_X;
+  constexpr int kTilesY = CHUNK_DIM_Y / TILE_DIM_Y;
+  constexpr int kStages = kTilesY * kTilesX;
+
   if (noop != nullptr && noop[0] == 1.0f) {
     return;
   }
@@ -188,7 +212,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
   const int32_t ctaid_X = blockIdx.x;
   const int32_t ctaid_Y = blockIdx.y;
   const int block_offset_Y = ctaid_Y * CHUNK_DIM_Y;
-  const int block_offset_X = ctaid_X * CHUNK_DIM_X;
+  const int block_offset_X = ctaid_X * kChunkX;
 
   // Tile lies fully inside one tensor (split_sections[i] % 128 == 0).
   const int tensor_id = GetTensorId(args, block_offset_Y);
@@ -217,8 +241,8 @@ __global__ void __launch_bounds__(THREADS_NUM)
 #pragma unroll
   for (int stage = 0; stage < PREFETCH_STAGES; ++stage) {
     const int buff_in = stage;
-    const int stage_Y = stage / TILES_X;
-    const int stage_X = stage % TILES_X;
+    const int stage_Y = stage / kTilesX;
+    const int stage_X = stage % kTilesX;
     const int global_offset_Y = block_offset_Y + stage_Y * TILE_DIM_Y;
     const int global_offset_X = block_offset_X + stage_X * TILE_DIM_X;
     if (leading_thread) {
@@ -234,16 +258,16 @@ __global__ void __launch_bounds__(THREADS_NUM)
   int IN_buff_readable_parity[BUFFS_NUM] = {0, 0};
 
 #pragma unroll
-  for (int stage = 0; stage < STAGES; ++stage) {
-    const int stage_Y = stage / TILES_X;
-    const int stage_X = stage % TILES_X;
+  for (int stage = 0; stage < kStages; ++stage) {
+    const int stage_Y = stage / kTilesX;
+    const int stage_X = stage % kTilesX;
 
     // Prefetch next stage.
-    if (stage < STAGES - PREFETCH_STAGES) {
+    if (stage < kStages - PREFETCH_STAGES) {
       const int next_prefetch_buff = (buff_in + PREFETCH_STAGES) % BUFFS_NUM;
-      const int next_prefetch_stage = (stage + PREFETCH_STAGES) % STAGES;
-      const int next_stage_Y = next_prefetch_stage / TILES_X;
-      const int next_stage_X = next_prefetch_stage % TILES_X;
+      const int next_prefetch_stage = (stage + PREFETCH_STAGES) % kStages;
+      const int next_stage_Y = next_prefetch_stage / kTilesX;
+      const int next_stage_X = next_prefetch_stage % kTilesX;
       const int next_global_offset_Y = block_offset_Y + next_stage_Y * TILE_DIM_Y;
       const int next_global_offset_X = block_offset_X + next_stage_X * TILE_DIM_X;
       if (leading_thread) {
@@ -311,11 +335,38 @@ __global__ void __launch_bounds__(THREADS_NUM)
     buff_in = (buff_in + 1) % BUFFS_NUM;
   }
 
-  // CTAs across (ctaid_X) share row_amax slots; across (ctaid_Y) share col_amax slots.
-  if (DO_ROW) {
+  // Cross-CTA row reduce. Default: GMEM atomicMax.
+  // kClusterDsmem: peers RD-push partials into leader CTA SMEM; leader fmaxes
+  // and stores once (requires clusterDim.x == gridDim.x == tiles_k). Col: atomic.
+  if constexpr (kClusterDsmem && DO_ROW) {
+    __shared__ float s_bufs[kMaxClusterCtas][CHUNK_DIM_Y];
+
+    cg::cluster_group cluster = cg::this_cluster();
+    const int num_cluster_ctas = static_cast<int>(cluster.num_blocks());
+    const int cluster_cta_rank = static_cast<int>(cluster.block_rank());
+    constexpr int kLeaderCtaRank = 0;
+
+    if (cluster_cta_rank == kLeaderCtaRank) {
+      s_bufs[kLeaderCtaRank][tid] = row_partial;
+    } else {
+      float* leader_s_bufs =
+          cluster.map_shared_rank(&s_bufs[0][0], /*cta_rank=*/kLeaderCtaRank);
+      leader_s_bufs[cluster_cta_rank * CHUNK_DIM_Y + tid] = row_partial;
+    }
+    cluster.sync();
+
+    if (cluster_cta_rank == kLeaderCtaRank) {
+      float row_amax = s_bufs[0][tid];
+#pragma unroll 1
+      for (int cta = 1; cta < num_cluster_ctas; ++cta) {
+        row_amax = fmaxf(row_amax, s_bufs[cta][tid]);
+      }
+      row_amax_out[local_row_base + tid] = row_amax;
+    }
+  } else if constexpr (DO_ROW) {
     atomicMaxFloat(&row_amax_out[local_row_base + tid], row_partial);
   }
-  if (DO_COL) {
+  if constexpr (DO_COL) {
     atomicMaxFloat(&col_amax_out[block_offset_X + tid], col_partial);
   }
 
@@ -952,6 +1003,41 @@ inline void launch_grouped_fused_cast_bf16(const NVFP4PerTokenMultiArgs& args,
 // Host launcher for the fused K1 path. bf16-only.
 // with_rht=true applies a 16-pt RHT on the col amax (rowwise raw). The
 // downstream K2 cast MUST use the same flag + mask.
+//
+// When NVTE_NVFP4_GROUP_CLUSTER_DSMEM=1 and rowwise-only, pick chunk_x / cluster
+// from K (see file header). NVTE_NVFP4_GROUP_AMAX_CHUNK_X overrides chunk_x.
+inline void pick_rowwise_amax_policy(int K, int* chunk_x, bool* use_cluster) {
+  // Auto strategy (rowwise-only):
+  //   2048<=K<=4096 && K%256==0 -> chunk 256 + cluster
+  //   256<=K<=2048  && K%128==0 -> chunk 128 + cluster
+  //   else                      -> chunk 128 + atomic
+  *chunk_x = CHUNK_DIM_X;
+  *use_cluster = false;
+  if ((K % 256 == 0) && K >= 2048 && K <= 4096) {
+    *chunk_x = 256;
+    *use_cluster = true;
+  } else if ((K % 128 == 0) && K >= 256 && K <= 2048) {
+    *chunk_x = 128;
+    *use_cluster = true;
+  }
+
+  // Optional force chunk; cluster only if resulting tiles_k is in [2, 16].
+  const int chunk_override =
+      transformer_engine::getenv<int>("NVTE_NVFP4_GROUP_AMAX_CHUNK_X", 0);
+  if (chunk_override == 256 && (K % 256 == 0)) {
+    *chunk_x = 256;
+  } else if (chunk_override == 128) {
+    *chunk_x = 128;
+  }
+  const int tiles_k = K / *chunk_x;
+  if (tiles_k < 2 || tiles_k > kMaxClusterCtas) {
+    *use_cluster = false;
+  } else if (chunk_override != 0) {
+    // Explicit chunk: allow cluster whenever tiles fit.
+    *use_cluster = true;
+  }
+}
+
 inline void launch_grouped_fused_amax_bf16(const NVFP4PerTokenMultiArgs& args,
                                            const SimpleTensor& input_data, int sum_M, int K,
                                            bool do_row, bool do_col, bool with_rht,
@@ -959,8 +1045,24 @@ inline void launch_grouped_fused_amax_bf16(const NVFP4PerTokenMultiArgs& args,
                                            cudaStream_t stream) {
   if (!do_row && !do_col) return;
 
-  // Pre-zero amax slots (atomicMax identity).
-  {
+  const bool cluster_env =
+      transformer_engine::getenv<int>("NVTE_NVFP4_GROUP_CLUSTER_DSMEM", 0) != 0;
+
+  int chunk_x = CHUNK_DIM_X;
+  bool use_cluster_dsmem = false;
+  if (cluster_env && do_row && !do_col) {
+    pick_rowwise_amax_policy(K, &chunk_x, &use_cluster_dsmem);
+  } else if (cluster_env && do_row && do_col) {
+    // Colwise needs chunk 128; row reduce may still use cluster when tiles fit.
+    chunk_x = CHUNK_DIM_X;
+    const int tiles_k = K / chunk_x;
+    use_cluster_dsmem = (tiles_k >= 2 && tiles_k <= kMaxClusterCtas);
+  }
+  const int tiles_k = K / chunk_x;
+
+  // Pre-zero amax (atomicMax identity). Cluster row-only path stores each row
+  // once, so row zero can be skipped when !do_col.
+  if (!(use_cluster_dsmem && do_row && !do_col)) {
     dim3 grid_zero(static_cast<unsigned>(args.num_tensors));
     dim3 block_zero(256);
     if (do_row && do_col) {
@@ -973,6 +1075,12 @@ inline void launch_grouped_fused_amax_bf16(const NVFP4PerTokenMultiArgs& args,
       group_per_token_fused_zero_amax_kernel<false, true>
           <<<grid_zero, block_zero, 0, stream>>>(args, K);
     }
+    NVTE_CHECK_CUDA(cudaGetLastError());
+  } else if (do_col) {
+    dim3 grid_zero(static_cast<unsigned>(args.num_tensors));
+    dim3 block_zero(256);
+    group_per_token_fused_zero_amax_kernel<false, true>
+        <<<grid_zero, block_zero, 0, stream>>>(args, K);
     NVTE_CHECK_CUDA(cudaGetLastError());
   }
 
@@ -987,21 +1095,58 @@ inline void launch_grouped_fused_amax_bf16(const NVFP4PerTokenMultiArgs& args,
       DIVUP_TO_MULTIPLE(buff_elems_total_in * sizeof(FusedIType), TMA_SHMEM_ALIGNMENT);
   constexpr int dshmem_size = buff_size_aligned_in + TMA_SHMEM_ALIGNMENT;
 
-  dim3 grid(static_cast<unsigned>(K / CHUNK_DIM_X), static_cast<unsigned>(sum_M / CHUNK_DIM_Y), 1);
+  dim3 grid(static_cast<unsigned>(tiles_k), static_cast<unsigned>(sum_M / CHUNK_DIM_Y), 1);
   dim3 block(THREADS_NUM, 1, 1);
 
-  // Collapse to kWithRht=false when no colwise amax is requested.
   const bool with_rht_effective = with_rht && do_col;
-  TRANSFORMER_ENGINE_SWITCH_CONDITION(
-      do_row, DO_ROW,
-      TRANSFORMER_ENGINE_SWITCH_CONDITION(
-          do_col, DO_COL, TRANSFORMER_ENGINE_SWITCH_CONDITION(with_rht_effective, kWithRht, {
-            auto kernel = group_per_token_fused_amax_kernel<DO_ROW, DO_COL, kWithRht>;
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size);
-            kernel<<<grid, block, dshmem_size, stream>>>(
-                tmap_in, args, noop, static_cast<size_t>(sum_M), static_cast<size_t>(K),
-                random_sign_mask_t);
-          })););
+
+  auto launch_amax = [&](auto kernel) {
+    NVTE_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         dshmem_size));
+    if (use_cluster_dsmem) {
+      NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+      cudaLaunchConfig_t cfg{};
+      cfg.gridDim = grid;
+      cfg.blockDim = block;
+      cfg.dynamicSmemBytes = static_cast<unsigned>(dshmem_size);
+      cfg.stream = stream;
+      cudaLaunchAttribute attrs[1];
+      attrs[0].id = cudaLaunchAttributeClusterDimension;
+      attrs[0].val.clusterDim.x = static_cast<unsigned>(tiles_k);
+      attrs[0].val.clusterDim.y = 1;
+      attrs[0].val.clusterDim.z = 1;
+      cfg.numAttrs = 1;
+      cfg.attrs = attrs;
+      NVTE_CHECK_CUDA(cudaLaunchKernelEx(&cfg, kernel, tmap_in, args, noop,
+                                         static_cast<size_t>(sum_M), static_cast<size_t>(K),
+                                         random_sign_mask_t));
+    } else {
+      kernel<<<grid, block, dshmem_size, stream>>>(tmap_in, args, noop, static_cast<size_t>(sum_M),
+                                                   static_cast<size_t>(K), random_sign_mask_t);
+    }
+  };
+
+  if (chunk_x == 256) {
+    TRANSFORMER_ENGINE_SWITCH_CONDITION(
+        do_row, DO_ROW,
+        TRANSFORMER_ENGINE_SWITCH_CONDITION(use_cluster_dsmem, kClusterDsmem, {
+          launch_amax(
+              group_per_token_fused_amax_kernel<DO_ROW, /*DO_COL=*/false, /*kWithRht=*/false,
+                                                kClusterDsmem, /*kChunkX=*/256>);
+        }));
+  } else {
+    TRANSFORMER_ENGINE_SWITCH_CONDITION(
+        do_row, DO_ROW,
+        TRANSFORMER_ENGINE_SWITCH_CONDITION(
+            do_col, DO_COL,
+            TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                with_rht_effective, kWithRht,
+                TRANSFORMER_ENGINE_SWITCH_CONDITION(use_cluster_dsmem, kClusterDsmem, {
+                  launch_amax(group_per_token_fused_amax_kernel<DO_ROW, DO_COL, kWithRht,
+                                                                kClusterDsmem, /*kChunkX=*/128>);
+                }))));
+  }
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
