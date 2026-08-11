@@ -572,7 +572,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("with_rht") = false, py::arg("random_sign_mask_t") = static_cast<int64_t>(0xACE1),
         py::arg("with_swizzle") = false);
   m.def("fused_multi_row_padding", &transformer_engine::pytorch::fused_multi_row_padding,
-        "Fused Multi-tensor padding", py::call_guard<py::gil_scoped_release>());
+        "Fused Multi-tensor padding (optional companion row-amax pad)",
+        py::arg("input"), py::arg("output"), py::arg("input_row_list"),
+        py::arg("padded_input_row_list"), py::arg("amax_input") = std::nullopt,
+        py::arg("amax_output") = std::nullopt, py::call_guard<py::gil_scoped_release>());
   m.def("fused_multi_row_unpadding", &transformer_engine::pytorch::fused_multi_row_unpadding,
         "Fused Multi-tensor unpadding", py::call_guard<py::gil_scoped_release>());
   m.def("swizzle_scales_for_gemm_", &transformer_engine::pytorch::inplace_swizzle_scale_for_gemm,
