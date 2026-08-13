@@ -247,6 +247,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("quantizer"));
   m.def("swiglu", transformer_engine::pytorch::swiglu, "SwiGLU activation", py::arg("input"),
         py::arg("quantizer"));
+  m.def("swiglu_with_row_amax", transformer_engine::pytorch::swiglu_with_row_amax,
+        "SwiGLU activation that also returns per-token row abs-max (fp32 [N])",
+        py::arg("input"));
   m.def("clamped_swiglu", transformer_engine::pytorch::clamped_swiglu,
         "SwiGLU activation used in GPT OSS", py::arg("input"), py::arg("quantizer"),
         py::arg("limit") = 7.0f, py::arg("alpha") = 1.702f, py::arg("glu_linear_offset") = 1.0f);

@@ -408,12 +408,14 @@ template <int nvec, bool aligned, typename ComputeType, typename Param,
           typename OutputType>
 __launch_bounds__(unary_kernel_threads) __global__
     void gated_act_kernel(const InputType *input, OutputType *output, const ComputeType *scale,
-                          ComputeType *amax, ComputeType *scale_inv, const size_t m, const size_t n,
-                          const Param p, const size_t num_aligned_elements) {
+                          ComputeType *amax, ComputeType *scale_inv, ComputeType *row_amax,
+                          const size_t m, const size_t n, const Param p,
+                          const size_t num_aligned_elements) {
   const size_t M = num_aligned_elements * m;
   ComputeType max = 0;
   ComputeType s = 1;
   const bool requires_amax = (amax != nullptr);
+  const bool requires_row_amax = (row_amax != nullptr);
   if constexpr (is_fp8<OutputType>::value) {
     if (scale != nullptr) s = *scale;
   }
@@ -428,6 +430,7 @@ __launch_bounds__(unary_kernel_threads) __global__
 
     loader0.load(id_x, n);
     loader1.load(id_x, n);
+    ComputeType row_chunk_max = 0;
 #pragma unroll
     for (int i = 0; i < nvec; ++i) {
       const ComputeType val = static_cast<ComputeType>(loader0.separate()[i]);
@@ -442,12 +445,21 @@ __launch_bounds__(unary_kernel_threads) __global__
         __builtin_assume(max >= 0);
         max = fmaxf(fabsf(temp), max);
       }
+      if (requires_row_amax) {
+        __builtin_assume(row_chunk_max >= 0);
+        row_chunk_max = fmaxf(fabsf(temp), row_chunk_max);
+      }
       if constexpr (is_fp8<OutputType>::value) {
         temp = temp * s;
       }
       storer.separate()[i] = static_cast<OutputType>(static_cast<ComputeType>(temp));
     }
     storer.store(id_x, n);
+    // Multiple CTAs/threads touch the same row across column chunks.
+    if (requires_row_amax) {
+      static_assert(std::is_same<ComputeType, float>::value);
+      atomicMaxFloat(row_amax + id_y, row_chunk_max);
+    }
   }
 
   // Reduce amax over block
@@ -472,7 +484,8 @@ template <int nvec, typename ComputeType, typename Param,
           typename OutputType>
 void GatedActivationKernelLauncher(const InputType *input, OutputType *output, const fp32 *scale,
                                    fp32 *amax, fp32 *scale_inv, const size_t m, const size_t n,
-                                   const Param &p, cudaStream_t stream) {
+                                   const Param &p, cudaStream_t stream,
+                                   fp32 *row_amax = nullptr) {
   if (m != 0 && n != 0) {
     size_t num_aligned_elements = get_num_aligned_elements(input, n, nvec, sizeof(InputType));
     constexpr size_t threads = unary_kernel_threads;
@@ -483,18 +496,19 @@ void GatedActivationKernelLauncher(const InputType *input, OutputType *output, c
     switch (auto align = CheckAlignment(n, nvec, input, input + n, output)) {
       case Alignment::SAME_ALIGNED:
         gated_act_kernel<nvec, true, ComputeType, Param, Activation>
-            <<<num_blocks, threads, 0, stream>>>(input, output, scale, amax, scale_inv, m, n, p,
-                                                 num_aligned_elements);
+            <<<num_blocks, threads, 0, stream>>>(input, output, scale, amax, scale_inv, row_amax, m,
+                                                 n, p, num_aligned_elements);
         break;
       case Alignment::SAME_UNALIGNED:
         gated_act_kernel<nvec, false, ComputeType, Param, Activation>
-            <<<num_blocks, threads, 0, stream>>>(input, output, scale, amax, scale_inv, m, n, p,
-                                                 num_aligned_elements);
+            <<<num_blocks, threads, 0, stream>>>(input, output, scale, amax, scale_inv, row_amax, m,
+                                                 n, p, num_aligned_elements);
         break;
       case Alignment::DIFFERENT: {
         // If the pointers are aligned differently we cannot vectorize
         gated_act_kernel<1, true, ComputeType, Param, Activation>
-            <<<num_blocks, threads, 0, stream>>>(input, output, scale, amax, scale_inv, m, n, p, n);
+            <<<num_blocks, threads, 0, stream>>>(input, output, scale, amax, scale_inv, row_amax, m,
+                                                 n, p, n);
         break;
       }
     }

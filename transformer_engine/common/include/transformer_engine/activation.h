@@ -321,6 +321,21 @@ void nvte_geglu(const NVTETensor input, NVTETensor output, cudaStream_t stream);
  */
 void nvte_swiglu(const NVTETensor input, NVTETensor output, cudaStream_t stream);
 
+/*! \brief Computes SwiGLU and a per-token (per-row) abs-max of the activation output.
+ *
+ *  Intended for NVFP4 per-token quantization that can skip the standalone K1 amax
+ *  kernel by consuming ``row_amax`` directly in the K2 cast.
+ *
+ *  \param[in]     input     Input tensor of shape [N, H * 2] (high precision).
+ *  \param[in,out] output    Output tensor of shape [N, H] (high precision).
+ *                           Computes Act(input[N, :H]) x input[N, H:].
+ *  \param[in,out] row_amax  Contiguous FP32 buffer of length N. Filled with
+ *                           ``max_j |output[i, j]|`` for each row ``i``.
+ *  \param[in]     stream    CUDA stream used for the operation.
+ */
+void nvte_swiglu_with_row_amax(const NVTETensor input, NVTETensor output, float* row_amax,
+                               cudaStream_t stream);
+
 /*! \brief Computes the gated Swish activation of the input used in GPT OSS.
  *
  *  \deprecated This function has been deprecated in favor of nvte_clamped_swiglu_v2,

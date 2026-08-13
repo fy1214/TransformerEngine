@@ -278,6 +278,13 @@ py::object dsilu(const at::Tensor &grad, const at::Tensor &input, py::handle qua
 
 py::object swiglu(const at::Tensor &input, py::handle quantizer);
 
+/*! Compute SwiGLU and return (output, row_amax).
+ *
+ *  ``row_amax`` is a contiguous FP32 CUDA tensor of shape ``[N]`` with
+ *  ``max_j |output[i, j]|``. High-precision path only (no quantizer).
+ */
+std::vector<at::Tensor> swiglu_with_row_amax(const at::Tensor &input);
+
 py::object dswiglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
 
 py::object clamped_swiglu(const at::Tensor &input, py::handle quantizer, float limit, float alpha,

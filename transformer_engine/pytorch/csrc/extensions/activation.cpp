@@ -331,6 +331,33 @@ py::object swiglu(const at::Tensor& input, py::handle quantizer) {
   return activation_helper<nvte_swiglu, nullptr>(input, quantizer, 2);
 }
 
+std::vector<at::Tensor> swiglu_with_row_amax(const at::Tensor& input) {
+  init_extension();
+
+  auto input_tensor = input.contiguous();
+  TORCH_CHECK(input_tensor.is_cuda(), "swiglu_with_row_amax input must be CUDA");
+  TORCH_CHECK(input_tensor.dim() >= 1, "swiglu_with_row_amax input must be at least 1D");
+  TORCH_CHECK(input_tensor.size(-1) % 2 == 0,
+              "swiglu_with_row_amax input last dim must be even");
+
+  const int64_t cols = input_tensor.size(-1) / 2;
+  auto output_shape = input_tensor.sizes().vec();
+  output_shape.back() = cols;
+  auto output = at::empty(output_shape, input_tensor.options());
+
+  const int64_t rows = input_tensor.numel() / input_tensor.size(-1);
+  auto row_amax = at::empty({rows}, input_tensor.options().dtype(at::kFloat));
+
+  auto input_nvte = makeTransformerEngineTensor(input_tensor);
+  auto output_nvte = makeTransformerEngineTensor(output);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_swiglu_with_row_amax(input_nvte.data(), output_nvte.data(),
+                              row_amax.data_ptr<float>(), stream);
+  });
+  return {std::move(output), std::move(row_amax)};
+}
+
 py::object dswiglu(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
   return dactivation_helper<nvte_dswiglu, nullptr>(grad, input, quantizer);
 }
