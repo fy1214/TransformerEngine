@@ -403,6 +403,36 @@ void VectorizedUnaryGradKernelLauncher(const InputTypeGrad *grad, const InputTyp
   }
 }
 
+/* Warp-segmented row amax: threads that share id_y first fmax via shfl_xor,
+ * then a single atomicMax per unique id_y in the warp. All 32 lanes must call
+ * this every iteration (use valid=false for idle lanes) so the warp stays
+ * convergent under independent thread scheduling.
+ */
+__device__ __forceinline__ void warp_segmented_atomic_max_row(float *row_amax, const bool valid,
+                                                               const size_t id_y,
+                                                               const float row_chunk_max) {
+  const unsigned active = __ballot_sync(0xffffffff, valid);
+  float v = row_chunk_max;
+  const int lane = static_cast<int>(threadIdx.x % THREADS_PER_WARP);
+#pragma unroll
+  for (int offset = static_cast<int>(THREADS_PER_WARP) / 2; offset > 0; offset /= 2) {
+    const float other = __shfl_xor_sync(0xffffffff, v, offset);
+    const size_t other_y = __shfl_xor_sync(0xffffffff, id_y, offset);
+    const bool other_valid = (active & (1u << (lane ^ offset))) != 0;
+    if (valid && other_valid && other_y == id_y) {
+      __builtin_assume(v >= 0);
+      __builtin_assume(other >= 0);
+      v = fmaxf(v, other);
+    }
+  }
+  if (valid) {
+    const unsigned match = __match_any_sync(active, static_cast<unsigned>(id_y));
+    if (lane == static_cast<int>(__ffs(match) - 1)) {
+      atomicMaxFloat(row_amax + id_y, v);
+    }
+  }
+}
+
 template <int nvec, bool aligned, typename ComputeType, typename Param,
           ComputeType (*Activation)(const ComputeType, const Param &), typename InputType,
           typename OutputType>
@@ -421,44 +451,54 @@ __launch_bounds__(unary_kernel_threads) __global__
   }
   const int warp_id = threadIdx.x / THREADS_PER_WARP;
 
-  for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x; tid < M; tid += gridDim.x * blockDim.x) {
-    const size_t id_x = tid % num_aligned_elements;
-    const size_t id_y = tid / num_aligned_elements;
-    VectorizedLoader<InputType, nvec, aligned> loader0(input + id_y * n * 2, n);
-    VectorizedLoader<InputType, nvec, aligned> loader1(input + id_y * n * 2 + n, n);
-    VectorizedStorer<OutputType, nvec, aligned> storer(output + id_y * n, n);
-
-    loader0.load(id_x, n);
-    loader1.load(id_x, n);
+  // Uniform iteration count keeps warps convergent when row_amax uses shfl/ballot.
+  const size_t stride = static_cast<size_t>(gridDim.x) * static_cast<size_t>(blockDim.x);
+  const size_t tid_start = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) +
+                           static_cast<size_t>(threadIdx.x);
+  const size_t n_iters = (M + stride - 1) / stride;
+  for (size_t iter = 0; iter < n_iters; ++iter) {
+    const size_t tid = tid_start + iter * stride;
+    const bool valid = tid < M;
     ComputeType row_chunk_max = 0;
-#pragma unroll
-    for (int i = 0; i < nvec; ++i) {
-      const ComputeType val = static_cast<ComputeType>(loader0.separate()[i]);
-      ComputeType val2 = static_cast<ComputeType>(loader1.separate()[i]);
+    size_t id_y = 0;
+    if (valid) {
+      const size_t id_x = tid % num_aligned_elements;
+      id_y = tid / num_aligned_elements;
+      VectorizedLoader<InputType, nvec, aligned> loader0(input + id_y * n * 2, n);
+      VectorizedLoader<InputType, nvec, aligned> loader1(input + id_y * n * 2 + n, n);
+      VectorizedStorer<OutputType, nvec, aligned> storer(output + id_y * n, n);
 
-      if constexpr (std::is_same<Param, ClampedSwiGLUParam>::value) {
-        ComputeType limit = p.limit;
-        val2 = std::min(std::max(-limit, val2), limit) + p.glu_linear_offset;
+      loader0.load(id_x, n);
+      loader1.load(id_x, n);
+#pragma unroll
+      for (int i = 0; i < nvec; ++i) {
+        const ComputeType val = static_cast<ComputeType>(loader0.separate()[i]);
+        ComputeType val2 = static_cast<ComputeType>(loader1.separate()[i]);
+
+        if constexpr (std::is_same<Param, ClampedSwiGLUParam>::value) {
+          ComputeType limit = p.limit;
+          val2 = std::min(std::max(-limit, val2), limit) + p.glu_linear_offset;
+        }
+        ComputeType temp = static_cast<ComputeType>(Activation(val, p) * val2);
+        if (requires_amax) {
+          __builtin_assume(max >= 0);
+          max = fmaxf(fabsf(temp), max);
+        }
+        if (requires_row_amax) {
+          __builtin_assume(row_chunk_max >= 0);
+          row_chunk_max = fmaxf(fabsf(temp), row_chunk_max);
+        }
+        if constexpr (is_fp8<OutputType>::value) {
+          temp = temp * s;
+        }
+        storer.separate()[i] = static_cast<OutputType>(static_cast<ComputeType>(temp));
       }
-      ComputeType temp = static_cast<ComputeType>(Activation(val, p) * val2);
-      if (requires_amax) {
-        __builtin_assume(max >= 0);
-        max = fmaxf(fabsf(temp), max);
-      }
-      if (requires_row_amax) {
-        __builtin_assume(row_chunk_max >= 0);
-        row_chunk_max = fmaxf(fabsf(temp), row_chunk_max);
-      }
-      if constexpr (is_fp8<OutputType>::value) {
-        temp = temp * s;
-      }
-      storer.separate()[i] = static_cast<OutputType>(static_cast<ComputeType>(temp));
+      storer.store(id_x, n);
     }
-    storer.store(id_x, n);
-    // Multiple CTAs/threads touch the same row across column chunks.
+    // Same-row lanes in the warp reduce first; one atomic per unique id_y.
     if (requires_row_amax) {
       static_assert(std::is_same<ComputeType, float>::value);
-      atomicMaxFloat(row_amax + id_y, row_chunk_max);
+      warp_segmented_atomic_max_row(row_amax, valid, id_y, row_chunk_max);
     }
   }
 
