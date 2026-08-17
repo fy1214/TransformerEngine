@@ -35,7 +35,6 @@
 #include <vector>
 
 #include "../common.h"
-#include "../nvtx.h"
 #include "../util/logging.h"
 #include "../util/system.h"
 #include "cute/tensor.hpp"
@@ -487,25 +486,19 @@ static void run_grouped_gemm(GemmT& gemm, typename GemmT::Arguments& args, int G
     workspace = persistent_buffer(workspace_size, stream, /*which=*/1);
   }
 
-  {
-    transformer_engine::nvtx::NVTXWrapper _nvtx("cutlass_grouped_init");
-    cutlass::Status status = gemm.can_implement(args);
-    NVTE_CHECK(status == cutlass::Status::kSuccess,
-               "CUTLASS NVFP4 grouped per-token GEMM cannot implement: ",
-               cutlassGetStatusString(status), " (num_groups=", G, ")");
+  cutlass::Status status = gemm.can_implement(args);
+  NVTE_CHECK(status == cutlass::Status::kSuccess,
+             "CUTLASS NVFP4 grouped per-token GEMM cannot implement: ",
+             cutlassGetStatusString(status), " (num_groups=", G, ")");
 
-    status = gemm.initialize(args, workspace, stream);
-    NVTE_CHECK(
-        status == cutlass::Status::kSuccess,
-        "CUTLASS NVFP4 grouped per-token GEMM initialize failed: ", cutlassGetStatusString(status));
-  }
+  status = gemm.initialize(args, workspace, stream);
+  NVTE_CHECK(
+      status == cutlass::Status::kSuccess,
+      "CUTLASS NVFP4 grouped per-token GEMM initialize failed: ", cutlassGetStatusString(status));
 
-  {
-    transformer_engine::nvtx::NVTXWrapper _nvtx("cutlass_grouped_run");
-    cutlass::Status status = gemm.run(stream);
-    NVTE_CHECK(status == cutlass::Status::kSuccess,
-               "CUTLASS NVFP4 grouped per-token GEMM run failed: ", cutlassGetStatusString(status));
-  }
+  status = gemm.run(stream);
+  NVTE_CHECK(status == cutlass::Status::kSuccess,
+             "CUTLASS NVFP4 grouped per-token GEMM run failed: ", cutlassGetStatusString(status));
 
   // No per-call frees: scratch + workspace live in persistent_buffer and are
   // reused across launches (and grow on demand).
@@ -716,23 +709,20 @@ static void run_cutlass_grouped_overwrite_variant(
   std::vector<const ElementSFT*> sfb_ptr_h(G);
   std::vector<ElementD*> d_ptr_h(G);
 
-  {
-    transformer_engine::nvtx::NVTXWrapper _nvtx("cutlass_grouped_pack_host");
-    for (int g = 0; g < G; ++g) {
-      const int M = Ms[g], N = Ns[g], K = Ks[g];
-      problems[g] = {M, N, K};
-      stride_A_h[g] = cutlass::make_cute_packed_stride(StrideAT{}, {M, K, 1});
-      stride_B_h[g] = cutlass::make_cute_packed_stride(StrideBT{}, {N, K, 1});
-      stride_C_h[g] = cutlass::make_cute_packed_stride(StrideCT{}, {M, N, 1});
-      stride_D_h[g] = cutlass::make_cute_packed_stride(StrideDT{}, {M, N, 1});
-      layout_SFA_h[g] = BlkCfgT::tile_atom_to_shape_SFA(cute_::make_shape(M, N, K, 1));
-      layout_SFB_h[g] = BlkCfgT::tile_atom_to_shape_SFB(cute_::make_shape(M, N, K, 1));
-      a_ptr_h[g] = reinterpret_cast<const ElementADataT*>(a_data_ptrs[g]);
-      b_ptr_h[g] = reinterpret_cast<const ElementBDataT*>(b_data_ptrs[g]);
-      sfa_ptr_h[g] = reinterpret_cast<const ElementSFT*>(a_sf_ptrs[g]);
-      sfb_ptr_h[g] = reinterpret_cast<const ElementSFT*>(b_sf_ptrs[g]);
-      d_ptr_h[g] = reinterpret_cast<ElementD*>(d_ptrs[g]);
-    }
+  for (int g = 0; g < G; ++g) {
+    const int M = Ms[g], N = Ns[g], K = Ks[g];
+    problems[g] = {M, N, K};
+    stride_A_h[g] = cutlass::make_cute_packed_stride(StrideAT{}, {M, K, 1});
+    stride_B_h[g] = cutlass::make_cute_packed_stride(StrideBT{}, {N, K, 1});
+    stride_C_h[g] = cutlass::make_cute_packed_stride(StrideCT{}, {M, N, 1});
+    stride_D_h[g] = cutlass::make_cute_packed_stride(StrideDT{}, {M, N, 1});
+    layout_SFA_h[g] = BlkCfgT::tile_atom_to_shape_SFA(cute_::make_shape(M, N, K, 1));
+    layout_SFB_h[g] = BlkCfgT::tile_atom_to_shape_SFB(cute_::make_shape(M, N, K, 1));
+    a_ptr_h[g] = reinterpret_cast<const ElementADataT*>(a_data_ptrs[g]);
+    b_ptr_h[g] = reinterpret_cast<const ElementBDataT*>(b_data_ptrs[g]);
+    sfa_ptr_h[g] = reinterpret_cast<const ElementSFT*>(a_sf_ptrs[g]);
+    sfb_ptr_h[g] = reinterpret_cast<const ElementSFT*>(b_sf_ptrs[g]);
+    d_ptr_h[g] = reinterpret_cast<ElementD*>(d_ptrs[g]);
   }
 
   const size_t need = align256(problems.size() * sizeof(problems[0])) +
@@ -780,7 +770,6 @@ static void run_cutlass_grouped_overwrite_variant(
   auto* alpha_a_d = put(alpha_a_ptrs);
   auto* alpha_b_d = put(alpha_b_ptrs);
   if (batched) {
-    transformer_engine::nvtx::NVTXWrapper _nvtx("cutlass_grouped_h2d");
     NVTE_CHECK_CUDA(cudaMemcpyAsync(scr, hscr, off, cudaMemcpyHostToDevice, stream));
   }
 
@@ -880,9 +869,7 @@ void nvte_nvfp4_cutlass_grouped_per_token_gemm(int num_groups, const NVTETensor*
              "NVFP4 grouped per-token GEMM bias requires BF16 outputs (fprop overwrite path)");
   std::vector<const float*> bias_ptrs(has_bias ? num_groups : 0);
 
-  {
-    transformer_engine::nvtx::NVTXWrapper _nvtx("cutlass_grouped_capi_setup");
-    for (int g = 0; g < num_groups; ++g) {
+  for (int g = 0; g < num_groups; ++g) {
     auto* a_t = convertNVTETensorCheck(a_data[g]);
     auto* b_t = convertNVTETensorCheck(b_data[g]);
     auto* sa_t = convertNVTETensorCheck(a_sf[g]);
@@ -938,7 +925,6 @@ void nvte_nvfp4_cutlass_grouped_per_token_gemm(int num_groups, const NVTETensor*
                  ": bias must be (N,)");
       bias_ptrs[g] = reinterpret_cast<const float*>(bias_t->data.dptr);
     }
-  }
   }
 
   if (d_is_fp32) {
