@@ -502,11 +502,12 @@ void nvfp4_cutlass_per_token_gemm(const at::Tensor &a_data, const at::Tensor &b_
 // Empty experts (M_g == 0) must be dropped by the caller. d may be bf16
 // (overwrite) or fp32; accumulate=true (requires fp32 d) computes d += ...
 // in place (wgrad fused into fp32 main_grad).
+// gemm_kind is "default" | "fc1" | "fc2": MoE tile family. Not inferred from K.
 void nvfp4_cutlass_grouped_per_token_gemm(
     std::vector<at::Tensor> a_data, std::vector<at::Tensor> b_data, std::vector<at::Tensor> a_sf,
     std::vector<at::Tensor> b_sf, std::vector<at::Tensor> alpha_a, std::vector<at::Tensor> alpha_b,
     std::vector<at::Tensor> d, bool a_sf_swizzled, bool b_sf_swizzled, bool accumulate,
-    std::vector<at::Tensor> bias = {});
+    std::vector<at::Tensor> bias = {}, const std::string &gemm_kind = "default");
 
 // with_swizzle=true makes K2 write rowwise scale_inv in the cuBLAS LT
 // swizzled tile layout (skips the standalone nvte_swizzle_scaling_factors).

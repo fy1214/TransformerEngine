@@ -6,6 +6,7 @@
 
 from typing import Union, Optional, Callable, Tuple, List
 from itertools import chain
+import inspect
 import os
 import warnings
 import weakref
@@ -66,6 +67,22 @@ from ...debug.pytorch.debug_quantization import DebugQuantizer
 from ...debug.pytorch.debug_state import TEDebugState
 
 __all__ = ["GroupedLinear"]
+
+_SPLIT_QUANTIZE_HAS_ROW_AMAX = False
+try:
+    _SPLIT_QUANTIZE_HAS_ROW_AMAX = "row_amax" in inspect.signature(tex.split_quantize).parameters
+except (TypeError, ValueError):
+    _SPLIT_QUANTIZE_HAS_ROW_AMAX = False
+
+
+def _split_quantize(tensor, m_splits, quantizers, *, row_amax=None, disable_bulk_allocation=False):
+    """split_quantize with optional prefused per-token row_amax (skip K1)."""
+    kwargs = {}
+    if disable_bulk_allocation:
+        kwargs["disable_bulk_allocation"] = True
+    if row_amax is not None and _SPLIT_QUANTIZE_HAS_ROW_AMAX:
+        kwargs["row_amax"] = row_amax
+    return tex.split_quantize(tensor, m_splits, quantizers, **kwargs)
 
 
 class _GroupedLinear(torch.autograd.Function):
@@ -386,6 +403,7 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.debug = False
             ctx.save_original_input = False
             ctx.input_quantizers = input_quantizers
+            ctx.input_row_amax = None
 
         return out.view(-1, *inp.shape[1:-1], out.shape[-1]), new_workspaces
 
@@ -424,6 +442,8 @@ class _GroupedLinear(torch.autograd.Function):
             skip_fp8_weight_update,
             save_original_input,
             debug,
+            input_row_amax,
+            gemm_kind,
         ) = non_tensor_args
         if fp8:
             backward_override = FP8GlobalStateManager.get_fp8_recipe().backward_override
@@ -536,10 +556,11 @@ class _GroupedLinear(torch.autograd.Function):
             # Disable bulk allocation when CPU offloading is active: offloading skips small
             # tensors (like scales), but bulk allocation shares storage across all tensors,
             # so if scales can't be offloaded, nothing in the group can be offloaded.
-            inputmats = tex.split_quantize(
+            inputmats = _split_quantize(
                 inp_view,
                 m_splits,
                 input_quantizers,
+                row_amax=input_row_amax,
                 disable_bulk_allocation=cpu_offloading,
             )
         elif debug:
@@ -604,6 +625,7 @@ class _GroupedLinear(torch.autograd.Function):
             bias=biases,
             use_bias=use_bias,
             use_split_accumulator=use_split_accumulator,
+            gemm_kind=gemm_kind,
         )
 
         if fp8_calibration:
@@ -700,6 +722,8 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.debug = debug
             ctx.save_original_input = save_original_input
             ctx.input_quantizers = input_quantizers
+            ctx.input_row_amax = input_row_amax
+            ctx.gemm_kind = gemm_kind
 
             # backward overrides
             if backward_override is not None:
@@ -1040,6 +1064,7 @@ class _GroupedLinear(torch.autograd.Function):
                     m_splits=ctx.m_splits,
                     grad=True,
                     use_split_accumulator=dgrad_gemm_use_split_accumulator,
+                    gemm_kind=ctx.gemm_kind,
                 )
 
             if ctx.weights_requires_grad:
@@ -1076,7 +1101,12 @@ class _GroupedLinear(torch.autograd.Function):
                                 input_quantizer.set_usage(rowwise=False, columnwise=True)
                     inputmats: list
                     if ctx.fp8 and not ctx.debug:
-                        inputmats = tex.split_quantize(inp_view, ctx.m_splits, ctx.input_quantizers)
+                        inputmats = _split_quantize(
+                            inp_view,
+                            ctx.m_splits,
+                            ctx.input_quantizers,
+                            row_amax=getattr(ctx, "input_row_amax", None),
+                        )
                     elif ctx.debug:
                         inputmats = DebugQuantizer.multi_tensor_quantize(
                             inp_view,
@@ -1113,6 +1143,7 @@ class _GroupedLinear(torch.autograd.Function):
                         if not getattr(ctx, "origin_weights_overwrite_main_grad", False)
                         else False
                     ),
+                    gemm_kind=ctx.gemm_kind,
                 )
                 # WGRAD
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
@@ -1274,6 +1305,7 @@ class GroupedLinear(TransformerEngineBaseModule):
         single_grouped_weight: bool = False,
         single_grouped_bias: bool = False,
         name: Optional[str] = None,
+        gemm_kind: str = "default",
     ) -> None:
         super().__init__(name)
 
@@ -1281,6 +1313,12 @@ class GroupedLinear(TransformerEngineBaseModule):
         self.num_gemms = num_gemms
         self.in_features = in_features
         self.out_features = out_features
+        self.gemm_kind = str(gemm_kind).lower()
+        if self.gemm_kind not in ("default", "fc1", "fc2"):
+            raise ValueError(
+                "gemm_kind must be 'default', 'fc1', or 'fc2' "
+                f"(NVFP4 grouped tile family), got {gemm_kind!r}"
+            )
         self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
         self.use_bias = bias
         self.return_bias = return_bias
@@ -1665,6 +1703,7 @@ class GroupedLinear(TransformerEngineBaseModule):
         inp: torch.Tensor,
         m_splits: torch.Tensor,
         is_first_microbatch: Optional[bool] = None,
+        input_row_amax: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Apply the linear transformation to the input.
@@ -1682,12 +1721,15 @@ class GroupedLinear(TransformerEngineBaseModule):
                              the model weights are not updated. Setting this parameter indicates
                              whether the current microbatch is the first in a minibatch or not.
                              When set, this parameter enables additional optimizations:
-
-                             * during FP8 training, it allows caching of the FP8 versions of
-                               the weights
-                             * it also allows skipping gradient accumulation during the
+                             * it enables caching of the converted FP8 input matrix,
+                             * it enables caching of the FP8 weight matrix,
+                             * it allows skipping gradient accumulation during the
                                first microbatch (since it is the first gradient being
                                produced)
+        input_row_amax : torch.Tensor, optional
+            Prefused per-token row abs-max ``(sum_M,)`` fp32, aligned with ``inp``
+            after MoE padding. When set, NVFP4 per-token split_quantize may skip K1.
+            Saved on the autograd ctx so ``save_original_input`` backward can reuse it.
         """
         debug = self.is_debug_iter()
         is_grad_enabled = torch.is_grad_enabled()
@@ -1784,6 +1826,8 @@ class GroupedLinear(TransformerEngineBaseModule):
                 skip_fp8_weight_update,
                 self.save_original_input,
                 debug,
+                input_row_amax,
+                self.gemm_kind,
             )
             out, new_workspaces = linear_fn(
                 *autograd_ctx, inp, m_splits, non_tensor_args, *weight_tensors, *bias_tensors

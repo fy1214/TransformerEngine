@@ -19,6 +19,18 @@
 extern "C" {
 #endif  // __cplusplus
 
+/*! \enum NVTENvfp4GroupedGemmKind
+ *  \brief Caller-selected tile family for grouped NVFP4 GEMM.
+ *
+ *  MoE fc1/fc2 cannot be inferred from K: intermediate sizes differ by model.
+ *  DEFAULT keeps the original 1-CTA (128,128,256) tile. FC1/FC2 select the
+ *  2-CTA tiles when M (and for FC1, N) are 256-aligned. */
+enum NVTENvfp4GroupedGemmKind {
+  NVTE_NVFP4_GROUPED_GEMM_DEFAULT = 0,
+  NVTE_NVFP4_GROUPED_GEMM_FC1 = 1,
+  NVTE_NVFP4_GROUPED_GEMM_FC2 = 2
+};
+
 /*! \brief D = alpha * (A @ B^T) + beta * C. A row-major (M,K), B col-major
  *  (K,N), D/C row-major (M,N). A/B FP4-e2m1 packed; SFs FP8-e4m3 in CUTLASS
  *  Sm1xxBlkScaledConfig layout; D BF16. M, N, K must be multiples of 256. */
@@ -59,8 +71,13 @@ void nvte_nvfp4_cutlass_per_token_gemm(const NVTETensor a_data, const NVTETensor
  *                  outputs (mutually exclusive with accumulate).
  *
  *  Each group must satisfy M_g % 128 == 0, N_g % 128 == 0, K % 128 == 0
- *  (same 1-CTA MmaTile = (128,128,256) constraint as the dense per-token
- *  kernel). Groups with M_g == 0 must be filtered out by the caller.
+ *  (default 1-CTA MmaTile = (128,128,256)). gemm_kind selects the tile
+ *  family; K is not used as an fc1/fc2 heuristic:
+ *    - DEFAULT: 1-CTA (128,128,256)
+ *    - FC1: 2-CTA (256,256,256) when M_g % 256 and N_g % 256, gated by
+ *      NVTE_NVFP4_GROUPED_FC1_2SM_N256 (default on)
+ *    - FC2: 2-CTA (256,128,256) when M_g % 256
+ *  Groups with M_g == 0 must be filtered out by the caller.
  *
  *  When d is FP32, accumulate=true computes d[g] += ... in place (wgrad fused
  *  into FP32 main_grad); accumulate=false overwrites. accumulate requires FP32
@@ -70,6 +87,7 @@ void nvte_nvfp4_cutlass_grouped_per_token_gemm(int num_groups, const NVTETensor 
                                                const NVTETensor *b_sf, const NVTETensor *alpha_a,
                                                const NVTETensor *alpha_b, NVTETensor *d,
                                                const NVTETensor *bias, bool accumulate,
+                                               enum NVTENvfp4GroupedGemmKind gemm_kind,
                                                cudaStream_t stream);
 
 #ifdef __cplusplus

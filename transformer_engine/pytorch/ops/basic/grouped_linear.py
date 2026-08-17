@@ -126,6 +126,7 @@ class GroupedLinear(BasicOperation):
         single_grouped_bias: bool = False,
         delay_wgrad_compute: bool = False,
         scale_bias: bool = False,
+        gemm_kind: str = "default",
     ) -> None:
         super().__init__()
 
@@ -146,6 +147,12 @@ class GroupedLinear(BasicOperation):
         self.single_grouped_weight: bool = single_grouped_weight
         self.single_grouped_bias: bool = single_grouped_bias
         self.use_bias: bool = bias
+        self.gemm_kind: str = str(gemm_kind).lower()
+        if self.gemm_kind not in ("default", "fc1", "fc2"):
+            raise ValueError(
+                "gemm_kind must be 'default', 'fc1', or 'fc2' "
+                f"(NVFP4 grouped tile family), got {gemm_kind!r}"
+            )
         if self.num_groups <= 0:
             raise ValueError(f"Invalid number of groups ({self.num_groups})")
         if self.in_features <= 0:
@@ -1163,6 +1170,7 @@ class GroupedLinear(BasicOperation):
             use_bias=use_gemm_bias,
             use_split_accumulator=_2X_ACC_FPROP,
             single_output=True,
+            gemm_kind=self.gemm_kind,
         )
 
         # Add bias * scales when scale_bias is enabled
@@ -1478,6 +1486,7 @@ class GroupedLinear(BasicOperation):
                 m_splits=split_sizes_int,
                 use_split_accumulator=_2X_ACC_DGRAD,
                 single_output=True,
+                gemm_kind=self.gemm_kind,
             )
 
         # Perform wgrad GEMMs
@@ -1496,6 +1505,7 @@ class GroupedLinear(BasicOperation):
                     m_splits=split_sizes_int,
                     use_split_accumulator=_2X_ACC_WGRAD,
                     accumulate=accumulate_into_main_grad,
+                    gemm_kind=self.gemm_kind,
                 )
                 self.wgrad_store.put([xs, dys, grad_weights], grouped_gemm_wgrad)
             else:
@@ -1509,6 +1519,7 @@ class GroupedLinear(BasicOperation):
                     m_splits=split_sizes_int,
                     use_split_accumulator=_2X_ACC_WGRAD,
                     accumulate=accumulate_into_main_grad,
+                    gemm_kind=self.gemm_kind,
                 )
 
         if not delay_wgrad:
