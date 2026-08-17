@@ -333,35 +333,26 @@ static bool use_batched_h2d() {
   return v;
 }
 
-// fc2: 2SM cluster needs M%256; MMA_N stays 128 (short-K reverse-epi).
-static bool should_use_2sm_n128(const std::vector<int>& Ms, NVTENvfp4GroupedGemmKind kind) {
-  if (kind != NVTE_NVFP4_GROUPED_GEMM_FC2 || Ms.empty()) return false;
-  for (int m : Ms) {
-    if (m % 256 != 0) return false;
+static bool all_aligned_256(const std::vector<int>& xs) {
+  if (xs.empty()) return false;
+  for (int x : xs) {
+    if (x % 256 != 0) return false;
   }
   return true;
 }
 
-// fc1 1SM MMA_N=256 (opt-in). Off by default.
-static bool should_use_1sm_n256(const std::vector<int>& Ns, NVTENvfp4GroupedGemmKind kind) {
-  static const bool enabled =
-      transformer_engine::getenv<bool>("NVTE_NVFP4_GROUPED_FC1_N256", false);
-  if (kind != NVTE_NVFP4_GROUPED_GEMM_FC1 || !enabled || Ns.empty()) return false;
-  for (int n : Ns) {
-    if (n % 256 != 0) return false;
+// Alternate-tile predicate: RequiredKind + which extents must be 256-aligned.
+// enabled is the env gate (fc2 is always on; fc1 2SM default on, 1SM N=256 off).
+template <NVTENvfp4GroupedGemmKind RequiredKind, bool CheckM, bool CheckN>
+static bool should_use_alt_tile(NVTENvfp4GroupedGemmKind kind,
+                                [[maybe_unused]] const std::vector<int>& Ms,
+                                [[maybe_unused]] const std::vector<int>& Ns, bool enabled) {
+  if (kind != RequiredKind || !enabled) return false;
+  if constexpr (CheckM) {
+    if (!all_aligned_256(Ms)) return false;
   }
-  return true;
-}
-
-// fc1: gated by NVTE_NVFP4_GROUPED_FC1_2SM_N256.
-// M%256 for the 2SM cluster; N%256 for MMA_N=256.
-static bool should_use_2sm_n256(const std::vector<int>& Ms, const std::vector<int>& Ns,
-                                NVTENvfp4GroupedGemmKind kind) {
-  static const bool enabled =
-      transformer_engine::getenv<bool>("NVTE_NVFP4_GROUPED_FC1_2SM_N256", true);
-  if (kind != NVTE_NVFP4_GROUPED_GEMM_FC1 || !enabled || Ms.empty()) return false;
-  for (size_t i = 0; i < Ms.size(); ++i) {
-    if (Ms[i] % 256 != 0 || Ns[i] % 256 != 0) return false;
+  if constexpr (CheckN) {
+    if (!all_aligned_256(Ns)) return false;
   }
   return true;
 }
@@ -705,23 +696,34 @@ void nvte_nvfp4_cutlass_grouped_per_token_gemm(int num_groups, const NVTETensor*
     }
   }
 
+  static const bool fc1_2sm_n256 =
+      transformer_engine::getenv<bool>("NVTE_NVFP4_GROUPED_FC1_2SM_N256", true);
+  static const bool fc1_1sm_n256 =
+      transformer_engine::getenv<bool>("NVTE_NVFP4_GROUPED_FC1_N256", false);
+
   if (d_is_fp32) {
     nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_impl</*Accumulate=*/true>(
         a_data_ptrs, b_data_ptrs, a_sf_ptrs, b_sf_ptrs, alpha_a_ptrs, alpha_b_ptrs,
         /*bias_ptrs=*/{}, d_ptrs, Ms, Ns, Ks, /*beta=*/accumulate ? 1.0f : 0.0f, stream);
-  } else if (!has_bias && nvfp4_cutlass::should_use_2sm_n256(Ms, Ns, gemm_kind)) {
+  } else if (!has_bias &&
+             nvfp4_cutlass::should_use_alt_tile<NVTE_NVFP4_GROUPED_GEMM_FC1, /*CheckM=*/true,
+                                               /*CheckN=*/true>(gemm_kind, Ms, Ns, fc1_2sm_n256)) {
     nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_impl<
         /*Accumulate=*/false, nvfp4_cutlass::Kernel2SmN256::Gemm,
         nvfp4_cutlass::Kernel2SmN256::FusedEVT, /*ClusterM=*/2>(
         a_data_ptrs, b_data_ptrs, a_sf_ptrs, b_sf_ptrs, alpha_a_ptrs, alpha_b_ptrs,
         /*bias_ptrs=*/{}, d_ptrs, Ms, Ns, Ks, /*beta=*/0.0f, stream);
-  } else if (!has_bias && nvfp4_cutlass::should_use_2sm_n128(Ms, gemm_kind)) {
+  } else if (!has_bias &&
+             nvfp4_cutlass::should_use_alt_tile<NVTE_NVFP4_GROUPED_GEMM_FC2, /*CheckM=*/true,
+                                               /*CheckN=*/false>(gemm_kind, Ms, Ns, true)) {
     nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_impl<
         /*Accumulate=*/false, nvfp4_cutlass::Kernel2SmN128::Gemm,
         nvfp4_cutlass::Kernel2SmN128::FusedEVT, /*ClusterM=*/2>(
         a_data_ptrs, b_data_ptrs, a_sf_ptrs, b_sf_ptrs, alpha_a_ptrs, alpha_b_ptrs,
         /*bias_ptrs=*/{}, d_ptrs, Ms, Ns, Ks, /*beta=*/0.0f, stream);
-  } else if (!has_bias && nvfp4_cutlass::should_use_1sm_n256(Ns, gemm_kind)) {
+  } else if (!has_bias &&
+             nvfp4_cutlass::should_use_alt_tile<NVTE_NVFP4_GROUPED_GEMM_FC1, /*CheckM=*/false,
+                                               /*CheckN=*/true>(gemm_kind, Ms, Ns, fc1_1sm_n256)) {
     nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_impl<
         /*Accumulate=*/false, nvfp4_cutlass::Kernel1SmN256::Gemm,
         nvfp4_cutlass::Kernel1SmN256::FusedEVT, /*ClusterM=*/1>(
