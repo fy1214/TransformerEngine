@@ -600,7 +600,7 @@ class PermuteWithMaskMapPrimitive(BasePrimitive):
         # Use input_output_aliases to alias pre-zeroed buffers to outputs.
         # This ensures padding positions contain zeros since the kernel only writes valid positions.
         # Input indices: 0=inp, 1=row_id_map, 2=probs, 3=scale, 4=permuted_scale,
-        #                5=pad_offsets, 6=output_buf, 7=permuted_probs_buf
+        #                5=pad_offsets, 6=output_buf, 7=permuted_probs_buf, 8=row_amax_dummy
         # Output indices: 0=output, 1=permuted_probs
         if with_pad:
             input_output_aliases = {6: 0}
@@ -620,6 +620,7 @@ class PermuteWithMaskMapPrimitive(BasePrimitive):
             pad_offsets,
             output_buf,
             permuted_probs_buf,
+            output_buf,  # row_amax_ptr dummy (COMPUTE_ROW_AMAX=False)
             grid=grid,
             input_output_aliases=input_output_aliases,
             constexprs={
@@ -644,6 +645,7 @@ class PermuteWithMaskMapPrimitive(BasePrimitive):
                 "PERMUTE_PROBS": with_probs,
                 "PERMUTE_SCALE": False,
                 "FUSION_PAD": with_pad,
+                "COMPUTE_ROW_AMAX": False,
                 "BLOCK_SIZE": block_size,
             },
         )
@@ -1738,7 +1740,7 @@ class SortChunksByMapPrimitive(BasePrimitive):
         # Declare input_output_aliases so XLA knows output slot 0 is claimed by
         # input 3 (output_buf). This prevents XLA from implicitly aliasing any
         # other input (like output_grad in backward) to the output buffer.
-        # Input indices: 0=inp, 1=row_id_map, 2=probs, 3=output_buf
+        # Input indices: 0=inp, 1=row_id_map, 2=probs, 3=output_buf, 4=row_amax_dummy
         # Output indices: 0=output, 1=permuted_probs
         input_output_aliases = {3: 0}
 
@@ -1749,6 +1751,7 @@ class SortChunksByMapPrimitive(BasePrimitive):
             row_id_map,
             probs,
             output_buf,
+            output_buf,  # row_amax_ptr dummy (COMPUTE_ROW_AMAX=False)
             grid=grid,
             input_output_aliases=input_output_aliases,
             constexprs={
@@ -1760,6 +1763,7 @@ class SortChunksByMapPrimitive(BasePrimitive):
                 "stride_permuted_probs_token": permuted_probs_stride_token,
                 "hidden_size": hidden_size,
                 "PERMUTE_PROBS": with_probs,
+                "COMPUTE_ROW_AMAX": False,
                 "FORWARD": is_forward,
                 "BLOCK_SIZE": block_size,
             },

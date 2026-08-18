@@ -12,7 +12,7 @@ of 128; up to 64 splits.
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -68,6 +68,9 @@ def nvfp4_per_token_group_quantize(
     with_rht: bool = False,
     random_sign_mask_t: int = _RHT_MASK_DEFAULT,
     with_swizzle: bool = False,
+    do_amax: bool = True,
+    row_amax: Optional[torch.Tensor] = None,
+    col_amax: Optional[torch.Tensor] = None,
 ) -> List[RefNVFP4TensorPerToken]:
     """Grouped NVFP4 per-token cast; returns N RefNVFP4TensorPerToken splits.
 
@@ -81,6 +84,12 @@ def nvfp4_per_token_group_quantize(
         random_sign_mask_t: low 16 bits = sign pattern shared by K1+K2.
         with_swizzle: True -> emit rowwise scale_inv in cuBLAS LT swizzled
             layout (GEMM can skip a separate swizzle pass).
+        do_amax: True (default) -> run K1 amax before K2 cast. False -> skip
+            K1 and use precomputed ``row_amax`` / ``col_amax``.
+        row_amax: optional ``(sum_M,)`` fp32; required when
+            ``do_amax=False`` and ``rowwise=True``.
+        col_amax: optional ``(num_tensors, K)`` fp32; required when
+            ``do_amax=False`` and ``columnwise=True``.
 
     Raises ``ValueError`` on shape / dtype / split-size violations.
     """
@@ -88,6 +97,11 @@ def nvfp4_per_token_group_quantize(
 
     if not (rowwise or columnwise):
         raise ValueError("At least one of rowwise / columnwise must be True.")
+    if not do_amax:
+        if rowwise and row_amax is None:
+            raise ValueError("row_amax is required when do_amax=False and rowwise=True")
+        if columnwise and col_amax is None:
+            raise ValueError("col_amax is required when do_amax=False and columnwise=True")
 
     _validate_per_token_group_input(x_concat, split_sections)
     split_sections_list = [int(M_i) for M_i in split_sections]
@@ -109,6 +123,9 @@ def nvfp4_per_token_group_quantize(
         with_rht=bool(with_rht),
         random_sign_mask_t=int(random_sign_mask_t) & 0xFFFF,
         with_swizzle=bool(with_swizzle),
+        do_amax=bool(do_amax),
+        row_amax=row_amax,
+        col_amax=col_amax,
     )
 
     outs: List[RefNVFP4TensorPerToken] = []

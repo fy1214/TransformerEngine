@@ -367,7 +367,7 @@ def moe_permute_mask_map_forward(
         fp8_dtype = None
         scale_hidden_dim = None
 
-    output, permuted_scale, permuted_probs = triton_permutation.permute_with_mask_map(
+    output, permuted_scale, permuted_probs, _ = triton_permutation.permute_with_mask_map(
         inp,
         row_id_map,
         probs,
@@ -722,7 +722,7 @@ def moe_unpermute_mask_map_backward_no_probs(
         fp8_dtype = None
         fp8_scale = None
 
-    act_grad, permuted_scale, _ = triton_permutation.permute_with_mask_map(
+    act_grad, permuted_scale, _, _ = triton_permutation.permute_with_mask_map(
         unpermuted_act_grad,
         row_id_map,
         None,
@@ -1134,7 +1134,7 @@ def moe_chunk_sort_forward(
         num_tokens,
         num_splits,
     )
-    output, permuted_probs = triton_permutation.sort_chunks_by_map(
+    output, permuted_probs, _ = triton_permutation.sort_chunks_by_map(
         inp,
         row_id_map,
         probs,
@@ -1193,7 +1193,7 @@ def moe_chunk_sort_backward(
         fake_dtype = permuted_act_grad.dtype
         permuted_act_grad = permuted_act_grad._data
 
-    act_grad, probs_grad = triton_permutation.sort_chunks_by_map(
+    act_grad, probs_grad, _ = triton_permutation.sort_chunks_by_map(
         permuted_act_grad,
         row_id_map,
         permuted_probs_grad,
