@@ -234,11 +234,23 @@ void nvfp4_cutlass_per_token_gemm(const at::Tensor &a_data, const at::Tensor &b_
 // SF inner block scales are swizzled here per group (same contract as the dense
 // entry points above) unless the corresponding *_sf_swizzled flag is set.
 // Callers must drop empty experts (M_g == 0) before calling.
+namespace {
+
+NVTENvfp4GroupedGemmKind parse_nvfp4_grouped_gemm_kind(const std::string &s) {
+  if (s.empty() || s == "default") return NVTE_NVFP4_GROUPED_GEMM_DEFAULT;
+  if (s == "fc1") return NVTE_NVFP4_GROUPED_GEMM_FC1;
+  if (s == "fc2") return NVTE_NVFP4_GROUPED_GEMM_FC2;
+  TORCH_CHECK(false, "gemm_kind must be 'default', 'fc1', or 'fc2', got '", s, "'");
+}
+
+}  // namespace
+
 void nvfp4_cutlass_grouped_per_token_gemm(
     std::vector<at::Tensor> a_data, std::vector<at::Tensor> b_data, std::vector<at::Tensor> a_sf,
     std::vector<at::Tensor> b_sf, std::vector<at::Tensor> alpha_a, std::vector<at::Tensor> alpha_b,
     std::vector<at::Tensor> d, bool a_sf_swizzled, bool b_sf_swizzled, bool accumulate,
-    std::vector<at::Tensor> bias) {
+    std::vector<at::Tensor> bias, const std::string &gemm_kind) {
+  const NVTENvfp4GroupedGemmKind kind = parse_nvfp4_grouped_gemm_kind(gemm_kind);
   const int64_t G = static_cast<int64_t>(a_data.size());
   TORCH_CHECK(G > 0, "grouped per-token GEMM needs at least one group");
   TORCH_CHECK(b_data.size() == static_cast<size_t>(G) && a_sf.size() == static_cast<size_t>(G) &&
@@ -382,7 +394,7 @@ void nvfp4_cutlass_grouped_per_token_gemm(
   nvte_nvfp4_cutlass_grouped_per_token_gemm(
       static_cast<int>(G), a_arr.data(), b_arr.data(), a_sf_arr.data(), b_sf_arr.data(),
       aa_arr.data(), ab_arr.data(), d_arr.data(), has_bias ? bias_arr.data() : nullptr, accumulate,
-      stream);
+      kind, stream);
 }
 
 }  // namespace transformer_engine::pytorch

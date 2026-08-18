@@ -387,6 +387,14 @@ def _nvfp4_per_token_gemm(
     return out
 
 
+def _parse_nvfp4_grouped_gemm_kind(gemm_kind: str) -> str:
+    """MoE tile family for grouped NVFP4 GEMM. Not inferred from K."""
+    kind = str(gemm_kind).lower()
+    if kind not in ("default", "fc1", "fc2"):
+        raise ValueError(f"gemm_kind must be 'default', 'fc1', or 'fc2', got {gemm_kind!r}")
+    return kind
+
+
 def _nvfp4_per_token_grouped_gemm(
     A: List[NVFP4TensorStorage],
     B: List[NVFP4TensorStorage],
@@ -398,6 +406,7 @@ def _nvfp4_per_token_grouped_gemm(
     single_output: bool,
     accumulate: bool = False,
     bias: Optional[List[torch.Tensor]] = None,
+    gemm_kind: str = "default",
 ) -> List[torch.Tensor]:
     """Native grouped (MoE) per-token NVFP4 GEMM (one ptr-array CUTLASS launch).
 
@@ -418,7 +427,11 @@ def _nvfp4_per_token_grouped_gemm(
 
     accumulate=True requires every output view to be fp32 (the main_grad
     buffers); the kernel computes beta=1 accumulation directly in the EVT.
+
+    gemm_kind is ``default`` / ``fc1`` / ``fc2``. Tile selection is not inferred
+    from K; callers must pass the MoE GEMM family.
     """
+    gemm_kind = _parse_nvfp4_grouped_gemm_kind(gemm_kind)
     if bias is not None:
         assert not accumulate, "NVFP4 per-token grouped GEMM bias is fprop-only (no accumulate)."
     # Same (transa, transb) -> rowwise/columnwise table as _nvfp4_per_token_gemm.
@@ -533,6 +546,7 @@ def _nvfp4_per_token_grouped_gemm(
             bool(b_sf_swz_seen),
             accumulate,
             bias_l,
+            gemm_kind,
         )
 
     if single_output:
@@ -781,9 +795,13 @@ def general_grouped_gemm(
     use_split_accumulator: bool = False,
     D_dtype: Optional[DType] = None,
     single_output=False,
+    gemm_kind: str = "default",
 ) -> Tuple[List[torch.Tensor], ...]:
     """
     TN layout Grouped GEMM with fp8 inputs.
+
+    gemm_kind (``default`` / ``fc1`` / ``fc2``) selects the NVFP4 per-token
+    grouped tile family. It is ignored for non-NVFP4 paths.
     """
     num_gemms = len(A)
 
@@ -865,6 +883,7 @@ def general_grouped_gemm(
                 single_output=single_output,
                 accumulate=accumulate,
                 bias=bias if use_bias else None,
+                gemm_kind=gemm_kind,
             )
             return out, grad_bias, gelu_input
 

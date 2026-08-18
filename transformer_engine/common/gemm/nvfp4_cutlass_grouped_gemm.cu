@@ -17,6 +17,14 @@
 //   * GroupProblemShape<Shape<int,int,int>> + KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100;
 //   * the EVT row/col broadcast leaves take ElementInput_ = float* so CUTLASS
 //     switches them to per-group array-of-pointers mode (ptr_col[l] / ptr_row[l]).
+//
+// Tile dispatch (BF16 overwrite, no bias). gemm_kind is caller-selected;
+// K is not an fc1/fc2 heuristic (MoE intermediate sizes differ by model):
+//   * DEFAULT: 1-CTA MmaTile=(128,128,256), MMA_N=128.
+//   * FC1 + M%256 + N%256: 2-CTA (256,256,256), MMA_N=256.
+//     Gated by NVTE_NVFP4_GROUPED_FC1_2SM_N256 (default on).
+//   * FC2 + M%256: 2-CTA (256,128,256), MMA_N=128.
+//   * FC1 opt-in 1-CTA (128,256,256) via NVTE_NVFP4_GROUPED_FC1_N256 (default off).
 
 #include <transformer_engine/nvfp4_cutlass_gemm.h>
 #include <transformer_engine/transformer_engine.h>
@@ -220,6 +228,60 @@ using GemmKernelBias = cutlass::gemm::kernel::GemmUniversal<ProblemShape, Collec
                                                             CollectiveEpilogueBias>;
 using GemmBias = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelBias>;
 
+// BF16 overwrite kernel parameterized by tile / cluster / schedule. EVT graph
+// is identical to FusedEVT above; only CtaTileShape and 1SM vs 2SM change.
+template <class MmaTile, class Cluster, class MainSched, class EpiSched>
+struct GroupedBf16Overwrite {
+  using RowScale = fusion::Sm90ColBroadcast<
+      /*Stages=*/0, MmaTile, /*ElementInput_=*/ElementScale*,
+      /*ElementCompute=*/ElementAccumulator>;
+  using ColScale = fusion::Sm90RowBroadcast<
+      /*Stages=*/0, MmaTile, /*ElementInput_=*/ElementScale*,
+      /*ElementCompute=*/ElementAccumulator>;
+  using ConstScale = fusion::Sm90ScalarBroadcast<ElementScale>;
+  using MulAccByRow = fusion::Sm90EVT<fusion::Sm90Compute<cutlass::multiplies, ElementAccumulator,
+                                                          ElementAccumulator, kRoundStyleFused>,
+                                      RowScale, AccFetchNode>;
+  using MulByCol = fusion::Sm90EVT<fusion::Sm90Compute<cutlass::multiplies, ElementAccumulator,
+                                                       ElementAccumulator, kRoundStyleFused>,
+                                   ColScale, MulAccByRow>;
+  using FusedEVT = fusion::Sm90EVT<
+      fusion::Sm90Compute<cutlass::multiplies, ElementD, ElementAccumulator, kRoundStyleFused>,
+      ConstScale, MulByCol>;
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, MmaTile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator, ElementAccumulator, ElementC, LayoutCTag*, AlignmentC, ElementD,
+      LayoutDTag*, AlignmentD, EpiSched, FusedEVT>::CollectiveOp;
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, ElementA, LayoutATag*, AlignmentA, ElementB, LayoutBTag*, AlignmentB,
+      ElementAccumulator, MmaTile, Cluster,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      MainSched>::CollectiveOp;
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+// fc2: 2SM cluster, MMA_N stays 128 (short K cannot hide OverlappingAccum).
+using Kernel2SmN128 = GroupedBf16Overwrite<
+    cute_::Shape<cute_::_256, cute_::_128, cute_::_256>,
+    cute_::Shape<cute_::_2, cute_::_1, cute_::_1>,
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmNvf4Sm100,
+    cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>;
+// fc1 opt-in: 1SM MMA_N=256. Off by default (NVTE_NVFP4_GROUPED_FC1_N256).
+using Kernel1SmN256 = GroupedBf16Overwrite<
+    cute_::Shape<cute_::_128, cute_::_256, cute_::_256>,
+    cute_::Shape<cute_::_1, cute_::_1, cute_::_1>,
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100,
+    cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>;
+// fc1: 2SM MMA_N=256 (CUTLASS example 75 tile). Needs long K for reverse-epi.
+using Kernel2SmN256 = GroupedBf16Overwrite<
+    cute_::Shape<cute_::_256, cute_::_256, cute_::_256>,
+    cute_::Shape<cute_::_2, cute_::_1, cute_::_1>,
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmNvf4Sm100,
+    cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>;
+
 // Query the SM count exactly once (cudaGetDeviceProperties is very slow and was
 // adding a ~ms fixed cost to every grouped launch).
 static int cached_sm_count() {
@@ -269,6 +331,30 @@ static void* persistent_host_buffer(size_t bytes) {
 static bool use_batched_h2d() {
   static bool v = transformer_engine::getenv<bool>("NVTE_NVFP4_GROUPED_BATCHED_H2D", true);
   return v;
+}
+
+static bool all_aligned_256(const std::vector<int>& xs) {
+  if (xs.empty()) return false;
+  for (int x : xs) {
+    if (x % 256 != 0) return false;
+  }
+  return true;
+}
+
+// Alternate-tile predicate: RequiredKind + which extents must be 256-aligned.
+// enabled is the env gate (fc2 is always on; fc1 2SM default on, 1SM N=256 off).
+template <NVTENvfp4GroupedGemmKind RequiredKind, bool CheckM, bool CheckN>
+static bool should_use_alt_tile(NVTENvfp4GroupedGemmKind kind,
+                                [[maybe_unused]] const std::vector<int>& Ms,
+                                [[maybe_unused]] const std::vector<int>& Ns, bool enabled) {
+  if (kind != RequiredKind || !enabled) return false;
+  if constexpr (CheckM) {
+    if (!all_aligned_256(Ms)) return false;
+  }
+  if constexpr (CheckN) {
+    if (!all_aligned_256(Ns)) return false;
+  }
+  return true;
 }
 
 // Build the shared Z-subtree EVT arguments:
@@ -329,7 +415,11 @@ static void run_grouped_gemm(GemmT& gemm, typename GemmT::Arguments& args, int G
 
 // Accumulate=false -> overwrite, ElementD=bf16. Accumulate=true -> fp32 output
 // with D += beta * C (beta=1 accumulates into main_grad, beta=0 overwrites).
-template <bool Accumulate>
+// OverwriteGemmT / OverwriteEVTT / ClusterM select an alternate tile for the
+// bf16 overwrite path (fc1/fc2). Accumulate and fused-bias stay on the default
+// 1SM (128,128,256) kernel.
+template <bool Accumulate, class OverwriteGemmT = Gemm, class OverwriteEVTT = FusedEVT,
+          int ClusterM = 1>
 static void run_cutlass_grouped_per_token_gemm_impl(
     const std::vector<const void*>& a_data_ptrs, const std::vector<const void*>& b_data_ptrs,
     const std::vector<const void*>& a_sf_ptrs, const std::vector<const void*>& b_sf_ptrs,
@@ -337,7 +427,7 @@ static void run_cutlass_grouped_per_token_gemm_impl(
     const std::vector<const float*>& bias_ptrs, const std::vector<void*>& d_ptrs,
     const std::vector<int>& Ms, const std::vector<int>& Ns, const std::vector<int>& Ks, float beta,
     cudaStream_t stream) {
-  using GemmT = std::conditional_t<Accumulate, GemmAcc, Gemm>;
+  using GemmT = std::conditional_t<Accumulate, GemmAcc, OverwriteGemmT>;
   using StrideAT = typename GemmT::GemmKernel::InternalStrideA;
   using StrideBT = typename GemmT::GemmKernel::InternalStrideB;
   using StrideCT = typename GemmT::GemmKernel::InternalStrideC;
@@ -445,6 +535,10 @@ static void run_cutlass_grouped_per_token_gemm_impl(
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = 0;
   hw_info.sm_count = cached_sm_count();
+  if constexpr (ClusterM == 2) {
+    hw_info.cluster_shape = dim3(2, 1, 1);
+    hw_info.cluster_shape_fallback = dim3(2, 1, 1);
+  }
 
   GemmT gemm;
   if constexpr (Accumulate) {
@@ -469,9 +563,9 @@ static void run_cutlass_grouped_per_token_gemm_impl(
         hw_info};
     run_grouped_gemm(gemm, args, G, stream);
   } else if (bias_d == nullptr) {
-    // Overwrite path: D = bf16(Z). GemmT == Gemm here.
-    typename FusedEVT::Arguments fusion_args =
-        make_z_args<typename FusedEVT::Arguments>(alpha_a_d, alpha_b_d);
+    // Overwrite path: D = bf16(Z).
+    typename OverwriteEVTT::Arguments fusion_args =
+        make_z_args<typename OverwriteEVTT::Arguments>(alpha_a_d, alpha_b_d);
     typename GemmT::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGrouped,
         {G, problems_d, /*host_problem_shapes=*/nullptr},
@@ -513,10 +607,15 @@ void nvte_nvfp4_cutlass_grouped_per_token_gemm(int num_groups, const NVTETensor*
                                                const NVTETensor* b_sf, const NVTETensor* alpha_a,
                                                const NVTETensor* alpha_b, NVTETensor* d,
                                                const NVTETensor* bias, bool accumulate,
+                                               enum NVTENvfp4GroupedGemmKind gemm_kind,
                                                cudaStream_t stream) {
   using namespace transformer_engine;
 
   NVTE_CHECK(num_groups > 0, "num_groups must be positive, got ", num_groups);
+  NVTE_CHECK(gemm_kind == NVTE_NVFP4_GROUPED_GEMM_DEFAULT ||
+                 gemm_kind == NVTE_NVFP4_GROUPED_GEMM_FC1 ||
+                 gemm_kind == NVTE_NVFP4_GROUPED_GEMM_FC2,
+             "gemm_kind must be DEFAULT, FC1, or FC2, got ", static_cast<int>(gemm_kind));
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   std::vector<const void*> a_data_ptrs(num_groups), b_data_ptrs(num_groups), a_sf_ptrs(num_groups),
@@ -597,10 +696,39 @@ void nvte_nvfp4_cutlass_grouped_per_token_gemm(int num_groups, const NVTETensor*
     }
   }
 
+  static const bool fc1_2sm_n256 =
+      transformer_engine::getenv<bool>("NVTE_NVFP4_GROUPED_FC1_2SM_N256", true);
+  static const bool fc1_1sm_n256 =
+      transformer_engine::getenv<bool>("NVTE_NVFP4_GROUPED_FC1_N256", false);
+
   if (d_is_fp32) {
     nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_impl</*Accumulate=*/true>(
         a_data_ptrs, b_data_ptrs, a_sf_ptrs, b_sf_ptrs, alpha_a_ptrs, alpha_b_ptrs,
         /*bias_ptrs=*/{}, d_ptrs, Ms, Ns, Ks, /*beta=*/accumulate ? 1.0f : 0.0f, stream);
+  } else if (!has_bias &&
+             nvfp4_cutlass::should_use_alt_tile<NVTE_NVFP4_GROUPED_GEMM_FC1, /*CheckM=*/true,
+                                               /*CheckN=*/true>(gemm_kind, Ms, Ns, fc1_2sm_n256)) {
+    nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_impl<
+        /*Accumulate=*/false, nvfp4_cutlass::Kernel2SmN256::Gemm,
+        nvfp4_cutlass::Kernel2SmN256::FusedEVT, /*ClusterM=*/2>(
+        a_data_ptrs, b_data_ptrs, a_sf_ptrs, b_sf_ptrs, alpha_a_ptrs, alpha_b_ptrs,
+        /*bias_ptrs=*/{}, d_ptrs, Ms, Ns, Ks, /*beta=*/0.0f, stream);
+  } else if (!has_bias &&
+             nvfp4_cutlass::should_use_alt_tile<NVTE_NVFP4_GROUPED_GEMM_FC2, /*CheckM=*/true,
+                                               /*CheckN=*/false>(gemm_kind, Ms, Ns, true)) {
+    nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_impl<
+        /*Accumulate=*/false, nvfp4_cutlass::Kernel2SmN128::Gemm,
+        nvfp4_cutlass::Kernel2SmN128::FusedEVT, /*ClusterM=*/2>(
+        a_data_ptrs, b_data_ptrs, a_sf_ptrs, b_sf_ptrs, alpha_a_ptrs, alpha_b_ptrs,
+        /*bias_ptrs=*/{}, d_ptrs, Ms, Ns, Ks, /*beta=*/0.0f, stream);
+  } else if (!has_bias &&
+             nvfp4_cutlass::should_use_alt_tile<NVTE_NVFP4_GROUPED_GEMM_FC1, /*CheckM=*/false,
+                                               /*CheckN=*/true>(gemm_kind, Ms, Ns, fc1_1sm_n256)) {
+    nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_impl<
+        /*Accumulate=*/false, nvfp4_cutlass::Kernel1SmN256::Gemm,
+        nvfp4_cutlass::Kernel1SmN256::FusedEVT, /*ClusterM=*/1>(
+        a_data_ptrs, b_data_ptrs, a_sf_ptrs, b_sf_ptrs, alpha_a_ptrs, alpha_b_ptrs,
+        /*bias_ptrs=*/{}, d_ptrs, Ms, Ns, Ks, /*beta=*/0.0f, stream);
   } else {
     nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_impl</*Accumulate=*/false>(
         a_data_ptrs, b_data_ptrs, a_sf_ptrs, b_sf_ptrs, alpha_a_ptrs, alpha_b_ptrs, bias_ptrs,

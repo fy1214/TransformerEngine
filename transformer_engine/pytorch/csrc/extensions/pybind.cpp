@@ -514,11 +514,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "group unless *_sf_swizzled is set. Empty experts must be filtered out. "
         "d may be bf16 (overwrite) or fp32; accumulate=true (fp32 d) adds in place. "
         "bias (optional) is a per-group fp32 (N_g,) vector fused into the epilogue "
-        "(fprop only; requires bf16 d).",
+        "(fprop only; requires bf16 d). "
+        "gemm_kind is 'default'|'fc1'|'fc2' (MoE tile family; not inferred from K).",
         py::arg("a_data"), py::arg("b_data"), py::arg("a_sf"), py::arg("b_sf"), py::arg("alpha_a"),
         py::arg("alpha_b"), py::arg("d"), py::arg("a_sf_swizzled") = false,
         py::arg("b_sf_swizzled") = false, py::arg("accumulate") = false,
-        py::arg("bias") = std::vector<at::Tensor>());
+        py::arg("bias") = std::vector<at::Tensor>(), py::arg("gemm_kind") = "default");
   m.def("nvfp4_per_token_post_scale", &transformer_engine::pytorch::nvfp4_per_token_post_scale,
         "Apply d[i,j] *= row_amax_a[i] * row_amax_b[j] in-place on bf16 D.", py::arg("d"),
         py::arg("row_amax_a"), py::arg("row_amax_b"));
