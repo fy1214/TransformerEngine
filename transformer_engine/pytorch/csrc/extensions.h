@@ -752,7 +752,9 @@ void multi_tensor_compute_scale_inv_e8m0_cuda(int chunk_size, const py::object &
 
 void fused_multi_row_padding(at::Tensor input, at::Tensor output,
                              std::vector<size_t> input_row_list,
-                             std::vector<size_t> padded_input_row_list);
+                             std::vector<size_t> padded_input_row_list,
+                             std::optional<at::Tensor> amax_input = std::nullopt,
+                             std::optional<at::Tensor> amax_output = std::nullopt);
 
 void fused_multi_row_unpadding(at::Tensor input, at::Tensor output,
                                std::vector<size_t> input_row_list,

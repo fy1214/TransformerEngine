@@ -44,6 +44,27 @@ extern "C" {
 void nvte_multi_padding(size_t num_tensors, const NVTETensor* input_list, NVTETensor* output_list,
                         const int* padded_num_rows_list, cudaStream_t stream);
 
+/*! \brief Padding multiple tensors together with companion FP32 per-row amax.
+ *
+ *  Same bottom-row padding as nvte_multi_padding, and additionally copies or
+ *  zero-pads a matching FP32 amax vector in the same kernel launch.
+ *  ``amax_input`` / ``amax_output`` are contiguous flat buffers laid out in the
+ *  same expert order as ``input_list`` (one float per row). Does not modify
+ *  ``nvte_multi_padding``.
+ *
+ *  \param[in]     num_tensors              Number of tensors.
+ *  \param[in]     input_list               List of 2D input tensors.
+ *  \param[in,out] output_list              List of padded tensors.
+ *  \param[in]     amax_input               Contiguous FP32 amax, length sum(input rows).
+ *  \param[in,out] amax_output              Contiguous FP32 amax, length sum(padded rows).
+ *  \param[in]     padded_num_rows_list     List of padded num rows corresponding to input tensors.
+ *  \param[in]     stream                   CUDA stream used for the operation.
+ */
+void nvte_multi_padding_with_amax(size_t num_tensors, const NVTETensor* input_list,
+                                  NVTETensor* output_list, const float* amax_input,
+                                  float* amax_output, const int* padded_num_rows_list,
+                                  cudaStream_t stream);
+
 /*! \brief Unpadding multiple tensors (reverse operation of padding).
  *
  *  NOTE: Unpadding mode only removes bottom rows.
