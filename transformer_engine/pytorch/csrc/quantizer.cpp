@@ -2635,10 +2635,14 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
       te_rng_state = makeTransformerEngineTensor(rng_state_at);
       rng_state_nvte = te_rng_state.data();
     }
+    const bool with_swizzle = this->optimize_for_gemm;
+    if (with_swizzle) {
+      out.set_with_gemm_swizzled_scales(true);
+    }
     NVTE_SCOPED_GIL_RELEASE({
       nvte_nvfp4_per_token_quantize(input.data(), nullptr, out.data(), this->with_rht ? 1 : 0,
                                     this->rht_matrix_random_sign_mask_t,
-                                    /*with_swizzle=*/0, this->stochastic_rounding ? 1 : 0,
+                                    with_swizzle ? 1 : 0, this->stochastic_rounding ? 1 : 0,
                                     rng_state_nvte, stream);
     });
     return;

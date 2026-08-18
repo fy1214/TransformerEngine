@@ -1631,9 +1631,13 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
     NVTE_CHECK(input.dtype() == DType::kBFloat16, "NVFP4 per-token split-quantize is bf16-only.");
 
     const size_t num_tensors = output_list.size();
+    const bool with_swizzle = quantizer.optimize_for_gemm;
     std::vector<NVTETensor> handles;
     handles.reserve(num_tensors);
     for (auto &out : output_list) {
+      if (with_swizzle) {
+        out.set_with_gemm_swizzled_scales(true);
+      }
       handles.push_back(out.data());
     }
 
@@ -1663,7 +1667,7 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
           input.data(), handles.data(), split_sections.data(), num_tensors, quantizer.rowwise_usage,
           quantizer.columnwise_usage, quantizer.with_rht ? 1 : 0,
           quantizer.rht_matrix_random_sign_mask_t,
-          /*with_swizzle=*/0, need_stochastic_rounding ? 1 : 0, rng_state_handle, stream);
+          with_swizzle ? 1 : 0, need_stochastic_rounding ? 1 : 0, rng_state_handle, stream);
     });
     return;
   }
