@@ -1274,7 +1274,7 @@ def _moe_chunk_sort_backward_wrapper(
     """Backward wrapper calling the custom backward op."""
     if ctx.empty_input:
         probs_grad = permuted_probs_grad if ctx.needs_probs_grad else None
-        return permuted_act_grad, None, None, None, probs_grad
+        return permuted_act_grad, None, None, probs_grad, None
 
     (row_id_map,) = ctx.saved_tensors
 
@@ -1291,7 +1291,7 @@ def _moe_chunk_sort_backward_wrapper(
     if not ctx.needs_probs_grad or probs_grad.numel() == 0:
         probs_grad = None
 
-    return act_grad, None, None, None, probs_grad
+    return act_grad, None, None, probs_grad, None
 
 
 moe_chunk_sort_forward.register_autograd(
