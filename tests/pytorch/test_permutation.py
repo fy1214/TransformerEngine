@@ -1399,6 +1399,22 @@ def _test_moe_chunk_sort(
             **tols,
         )
 
+        if te_dtype == te.DType.kBFloat16:
+            fused_out, row_amax = te_sort_chunks_by_index(
+                te_fwd_input.detach(),
+                split_sizes_cuda,
+                sorted_idxs_cuda,
+                compute_row_amax=True,
+            )
+            ref_amax = fused_out.detach().abs().amax(dim=-1).to(torch.float32)
+            torch.testing.assert_close(
+                row_amax,
+                ref_amax,
+                msg="Mismatch in fused chunk-sort row_amax",
+                rtol=0,
+                atol=0,
+            )
+
     if not pytorch_fwd_input.numel():
         print("Empty pytorch_fwd_input activation test passed.")
         return
