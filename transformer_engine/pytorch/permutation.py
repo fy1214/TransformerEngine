@@ -1112,11 +1112,18 @@ def moe_chunk_sort_forward(
     split_sizes: torch.Tensor,
     sorted_idxs: torch.Tensor,
     probs: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Forward pass for MoE chunk sort. Returns (output, permuted_probs, row_id_map)."""
+    compute_row_amax: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward pass for MoE chunk sort.
+
+    Returns ``(output, permuted_probs, row_id_map, row_amax)``. ``row_amax`` is an
+    empty fp32 tensor when ``compute_row_amax`` is False; otherwise it holds the
+    per-dst-row abs-max of ``output`` (shape ``[num_tokens]``).
+    """
     if not inp.numel():
         probs_out = probs.clone() if probs is not None else torch.empty(0, device=inp.device)
-        return inp.clone(), probs_out, torch.empty(0, device=inp.device, dtype=torch.int32)
+        empty_amax = torch.empty(0, device=inp.device, dtype=torch.float32)
+        return inp.clone(), probs_out, torch.empty(0, device=inp.device, dtype=torch.int32), empty_amax
 
     num_tokens, hidden_size = inp.shape
     num_splits = split_sizes.size(0)
@@ -1134,13 +1141,14 @@ def moe_chunk_sort_forward(
         num_tokens,
         num_splits,
     )
-    output, permuted_probs, _ = triton_permutation.sort_chunks_by_map(
+    output, permuted_probs, row_amax = triton_permutation.sort_chunks_by_map(
         inp,
         row_id_map,
         probs,
         num_tokens,
         hidden_size,
         is_forward=True,
+        compute_row_amax=compute_row_amax,
     )
     if fp8:
         output = Float8Tensor(
@@ -1153,8 +1161,10 @@ def moe_chunk_sort_forward(
 
     if permuted_probs is None:
         permuted_probs = torch.empty(0, device=output.device)
+    if row_amax is None:
+        row_amax = torch.empty(0, device=output.device, dtype=torch.float32)
 
-    return output, permuted_probs, row_id_map
+    return output, permuted_probs, row_id_map, row_amax
 
 
 @moe_chunk_sort_forward.register_fake
@@ -1163,7 +1173,8 @@ def _moe_chunk_sort_forward_fake(  # pylint: disable=unused-argument
     split_sizes: torch.Tensor,
     sorted_idxs: torch.Tensor,
     probs: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    compute_row_amax: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fake for shape inference."""
     num_tokens = inp.shape[0]
     hidden_size = inp.shape[1]
@@ -1174,7 +1185,11 @@ def _moe_chunk_sort_forward_fake(  # pylint: disable=unused-argument
         fake_probs = torch.empty(0, device=inp.device)
     # row_id_map: 1D, size num_tokens
     fake_row_id_map = torch.empty((num_tokens,), dtype=torch.int32, device=inp.device)
-    return fake_output, fake_probs, fake_row_id_map
+    if compute_row_amax and num_tokens > 0:
+        fake_row_amax = torch.empty((num_tokens,), dtype=torch.float32, device=inp.device)
+    else:
+        fake_row_amax = torch.empty(0, device=inp.device, dtype=torch.float32)
+    return fake_output, fake_probs, fake_row_id_map, fake_row_amax
 
 
 @torch.library.custom_op("te_moe::chunk_sort_bwd", mutates_args=[])
@@ -1244,8 +1259,8 @@ def _moe_chunk_sort_backward_fake(  # pylint: disable=unused-argument
 
 def _moe_chunk_sort_setup_context(ctx, inputs, output):
     """Save context for backward pass."""
-    inp, _split_sizes, _sorted_idxs, probs = inputs
-    _output_tensor, _permuted_probs, row_id_map = output
+    inp, _split_sizes, _sorted_idxs, probs, _compute_row_amax = inputs
+    _output_tensor, _permuted_probs, row_id_map, _row_amax = output
     ctx.empty_input = inp.size(0) == 0
     ctx.save_for_backward(row_id_map)
     ctx.num_tokens = inp.size(0)
@@ -1253,11 +1268,13 @@ def _moe_chunk_sort_setup_context(ctx, inputs, output):
     ctx.needs_probs_grad = probs is not None and probs.requires_grad
 
 
-def _moe_chunk_sort_backward_wrapper(ctx, permuted_act_grad, permuted_probs_grad, _row_id_map_grad):
+def _moe_chunk_sort_backward_wrapper(
+    ctx, permuted_act_grad, permuted_probs_grad, _row_id_map_grad, _row_amax_grad
+):
     """Backward wrapper calling the custom backward op."""
     if ctx.empty_input:
         probs_grad = permuted_probs_grad if ctx.needs_probs_grad else None
-        return permuted_act_grad, None, None, probs_grad
+        return permuted_act_grad, None, None, None, probs_grad
 
     (row_id_map,) = ctx.saved_tensors
 
@@ -1274,7 +1291,7 @@ def _moe_chunk_sort_backward_wrapper(ctx, permuted_act_grad, permuted_probs_grad
     if not ctx.needs_probs_grad or probs_grad.numel() == 0:
         probs_grad = None
 
-    return act_grad, None, None, probs_grad
+    return act_grad, None, None, None, probs_grad
 
 
 moe_chunk_sort_forward.register_autograd(
@@ -1295,7 +1312,8 @@ def moe_sort_chunks_by_index(
     inp: torch.Tensor,
     split_sizes: torch.Tensor,
     sorted_index: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    compute_row_amax: bool = False,
+) -> Tuple[torch.Tensor, ...]:
     """
     Split and sort the input tensor based on the split_sizes and sorted indices.
     The inp tensor is splitted along dim-0 according to the split_sizes list and then sorted
@@ -1309,8 +1327,15 @@ def moe_sort_chunks_by_index(
         Chunk sizes of the inp tensor along the 0-th dimension.
     sorted_indices : torch.Tensor
         Chunk indices used to permute the chunks.
+    compute_row_amax : bool, default = False
+        If True, also return a fp32 per-dst-row abs-max tensor of shape ``[num_tokens]``
+        fused into the sort kernel.
     """
-    output, _, _ = torch.ops.te_moe.chunk_sort_fwd(inp, split_sizes, sorted_index, None)
+    output, _, _, row_amax = torch.ops.te_moe.chunk_sort_fwd(
+        inp, split_sizes, sorted_index, None, compute_row_amax
+    )
+    if compute_row_amax:
+        return output, row_amax
     return output
 
 
@@ -1319,7 +1344,8 @@ def moe_sort_chunks_by_index_with_probs(
     probs: torch.Tensor,
     split_sizes: torch.Tensor,
     sorted_index: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    compute_row_amax: bool = False,
+) -> Tuple[torch.Tensor, ...]:
     """
     Split and sort the input tensor and probs based on the split_sizes and sorted indices.
     The inp tensor is splitted along dim-0 according to the split_sizes list and then sorted
@@ -1337,8 +1363,13 @@ def moe_sort_chunks_by_index_with_probs(
         Chunk sizes of the inp tensor along the 0-th dimension.
     sorted_indices : torch.Tensor
         Chunk indices used to permute the chunks.
+    compute_row_amax : bool, default = False
+        If True, also return a fp32 per-dst-row abs-max tensor of shape ``[num_tokens]``
+        fused into the sort kernel.
     """
-    output, permuted_probs, _ = torch.ops.te_moe.chunk_sort_fwd(
-        inp, split_sizes, sorted_index, probs
+    output, permuted_probs, _, row_amax = torch.ops.te_moe.chunk_sort_fwd(
+        inp, split_sizes, sorted_index, probs, compute_row_amax
     )
+    if compute_row_amax:
+        return output, permuted_probs, row_amax
     return output, permuted_probs
