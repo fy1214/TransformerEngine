@@ -1006,7 +1006,8 @@ std::tuple<std::vector<py::object>, std::vector<TensorWrapper>, bool> bulk_alloc
     }
   }
   const bool with_gemm_swizzled_scales =
-      group_optimize_for_gemm && group_with_rht && all_tensors_rht_cast_fusion_eligible;
+      group_optimize_for_gemm &&
+      (per_token || (group_with_rht && all_tensors_rht_cast_fusion_eligible));
 
   // Helper function to get size of byte buffer holding FP4 data (last dim divided by 2)
   auto fp4_byte_shape = [](const std::vector<size_t> &shape) -> std::vector<size_t> {
@@ -1556,7 +1557,8 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
                                const std::vector<TensorWrapper> &input_list,
                                std::vector<TensorWrapper> &output_list,
                                const std::vector<size_t> &split_sections,
-                               const std::vector<NVFP4Quantizer *> &quantizers) {
+                               const std::vector<NVFP4Quantizer *> &quantizers,
+                               const std::optional<at::Tensor> &prefused_row_amax) {
   // Check tensor lists
   const size_t num_tensors = split_sections.size();
   NVTE_CHECK(input_list.size() == num_tensors, "Expected ", num_tensors, " input tensors, but got ",
@@ -1632,6 +1634,29 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
 
     const size_t num_tensors = output_list.size();
     const bool with_swizzle = quantizer.optimize_for_gemm;
+
+    const bool skip_rowwise_k1 =
+        prefused_row_amax.has_value() && quantizer.rowwise_usage && !quantizer.columnwise_usage;
+    if (skip_rowwise_k1) {
+      const at::Tensor &row_amax_in = prefused_row_amax.value();
+      NVTE_CHECK(row_amax_in.is_cuda() && row_amax_in.is_contiguous(),
+                 "prefused row_amax must be a contiguous CUDA tensor");
+      NVTE_CHECK(row_amax_in.scalar_type() == at::ScalarType::Float,
+                 "prefused row_amax must be float32");
+      const int64_t sum_M = static_cast<int64_t>(input.size(0));
+      NVTE_CHECK(row_amax_in.numel() == sum_M,
+                 "prefused row_amax numel mismatch: expected ", sum_M, ", got ",
+                 row_amax_in.numel());
+      int64_t m_off = 0;
+      for (size_t i = 0; i < num_tensors; ++i) {
+        const int64_t M_i = static_cast<int64_t>(split_sections[i]);
+        auto amax_view = row_amax_in.narrow(0, m_off, M_i);
+        output_list[i].set_amax(amax_view.data_ptr(), DType::kFloat32,
+                                std::vector<size_t>{static_cast<size_t>(M_i)});
+        m_off += M_i;
+      }
+    }
+
     std::vector<NVTETensor> handles;
     handles.reserve(num_tensors);
     for (auto &out : output_list) {
@@ -1663,11 +1688,19 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
     }
 
     NVTE_SCOPED_GIL_RELEASE({
-      nvte_group_nvfp4_per_token_quantize(
-          input.data(), handles.data(), split_sections.data(), num_tensors, quantizer.rowwise_usage,
-          quantizer.columnwise_usage, quantizer.with_rht ? 1 : 0,
-          quantizer.rht_matrix_random_sign_mask_t,
-          with_swizzle ? 1 : 0, need_stochastic_rounding ? 1 : 0, rng_state_handle, stream);
+      if (skip_rowwise_k1) {
+        nvte_group_nvfp4_per_token_cast(
+            input.data(), handles.data(), split_sections.data(), num_tensors,
+            quantizer.rowwise_usage, quantizer.columnwise_usage, quantizer.with_rht ? 1 : 0,
+            quantizer.rht_matrix_random_sign_mask_t, with_swizzle ? 1 : 0,
+            need_stochastic_rounding ? 1 : 0, rng_state_handle, stream);
+      } else {
+        nvte_group_nvfp4_per_token_quantize(
+            input.data(), handles.data(), split_sections.data(), num_tensors,
+            quantizer.rowwise_usage, quantizer.columnwise_usage, quantizer.with_rht ? 1 : 0,
+            quantizer.rht_matrix_random_sign_mask_t, with_swizzle ? 1 : 0,
+            need_stochastic_rounding ? 1 : 0, rng_state_handle, stream);
+      }
     });
     return;
   }
@@ -1693,7 +1726,8 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
 std::vector<py::object> split_quantize(const at::Tensor &tensor,
                                        const std::vector<size_t> &split_sections,
                                        std::vector<py::handle> quantizer_list,
-                                       bool disable_bulk_allocation) {
+                                       bool disable_bulk_allocation,
+                                       const std::optional<at::Tensor> &row_amax) {
   init_extension();
 
   // Check number of tensors
@@ -1845,12 +1879,18 @@ std::vector<py::object> split_quantize(const at::Tensor &tensor,
         nvfp4_quantizers.push_back(static_cast<NVFP4Quantizer *>(quantizer.get()));
       }
       split_quantize_nvfp4_impl(input_nvte, input_list, output_cpp_list, split_sections,
-                                nvfp4_quantizers);
+                                nvfp4_quantizers, row_amax);
       break;
     }
     default:
       // General multi-tensor quantization
       multi_tensor_quantize_impl(input_list, quantizer_list, quantizer_cpp_list, output_cpp_list);
+  }
+
+  for (size_t i = 0; i < output_py_list.size(); ++i) {
+    if (output_cpp_list[i].get_with_gemm_swizzled_scales()) {
+      output_py_list[i].attr("_with_gemm_swizzled_scales") = true;
+    }
   }
 
   return output_py_list;
