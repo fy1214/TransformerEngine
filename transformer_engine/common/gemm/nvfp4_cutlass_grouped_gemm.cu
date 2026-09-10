@@ -595,6 +595,260 @@ static void run_cutlass_grouped_per_token_gemm_impl(
   }
 }
 
+// ---- Dense / contiguous-offset path (device-side metadata fill) ------------
+// Mirrors miniTE gemm_grouped_cutlass_v2_evt fill_grouped_gemm_args_kernel:
+// operands stay concatenated; ptr/stride/layout/problem tables are written on
+// device so the host list→H2D path is skipped. Still launches the same
+// PtrArray TMA NVFP4 GemmUniversal instances (and TE dual-alpha EVT).
+
+// Exclusive prefix tables for dense MoE packing (one thread per group):
+//   a_row[g+1] = sum_{i<=g} M_i
+//   b_row[g+1] = (g+1) * N
+//   a_sf[g+1]  = a_row[g+1] * k_sf     (k_sf = K/16 SF elems per row)
+//   b_sf[g+1]  = b_row[g+1] * k_sf
+// Launch: <<<1, G, G*sizeof(int32_t), stream>>>
+__global__ void fill_grouped_per_token_dense_prefix_offsets_kernel(
+    const int32_t* __restrict__ m_splits, int32_t* __restrict__ a_row,
+    int32_t* __restrict__ b_row, int64_t* __restrict__ a_sf, int64_t* __restrict__ b_sf, int G,
+    int N, int k_sf) {
+  extern __shared__ int32_t smem_m[];
+  const int g = static_cast<int>(threadIdx.x);
+  if (g < G) {
+    smem_m[g] = m_splits[g];
+  }
+  __syncthreads();
+
+  int32_t excl_m = 0;
+  for (int i = 0; i < g && i < G; ++i) {
+    excl_m += smem_m[i];
+  }
+
+  if (g == 0) {
+    a_row[0] = 0;
+    b_row[0] = 0;
+    a_sf[0] = 0;
+    b_sf[0] = 0;
+  }
+  if (g < G) {
+    const int32_t m = smem_m[g];
+    const int32_t a_end = excl_m + m;
+    const int32_t b_end = (g + 1) * N;
+    a_row[g + 1] = a_end;
+    b_row[g + 1] = b_end;
+    a_sf[g + 1] = static_cast<int64_t>(a_end) * k_sf;
+    b_sf[g + 1] = static_cast<int64_t>(b_end) * k_sf;
+  }
+}
+
+template <class StrideAT, class StrideBT, class StrideCT, class StrideDT, class LayoutSFAT,
+          class LayoutSFBT, class BlkCfgT, class ElementDT>
+__global__ void fill_grouped_per_token_dense_args_kernel(
+    const ElementADataT** ptr_A, const ElementBDataT** ptr_B, const ElementSFT** ptr_SFA,
+    const ElementSFT** ptr_SFB, ElementDT** ptr_D, const float** ptr_alpha_a,
+    const float** ptr_alpha_b, StrideAT* stride_A, StrideBT* stride_B, StrideCT* stride_C,
+    StrideDT* stride_D, LayoutSFAT* layout_SFA, LayoutSFBT* layout_SFB,
+    typename ProblemShape::UnderlyingProblemShape* problem_sizes, const void* a_base,
+    const void* b_base, const void* sfa_base, const void* sfb_base, void* d_base,
+    const float* alpha_a_base, const float* alpha_b_base, const int32_t* a_row_offsets,
+    const int32_t* b_row_offsets, const int64_t* a_sf_offsets, const int64_t* b_sf_offsets,
+    int K_packed, int K, int N) {
+  const int g = static_cast<int>(threadIdx.x);
+  const int M_g = a_row_offsets[g + 1] - a_row_offsets[g];
+  const int N_g = b_row_offsets[g + 1] - b_row_offsets[g];
+
+  // A/B stored as packed FP4 uint8 rows of length K_packed = K/2.
+  ptr_A[g] = reinterpret_cast<const ElementADataT*>(
+      static_cast<const char*>(a_base) + static_cast<int64_t>(a_row_offsets[g]) * K_packed);
+  ptr_B[g] = reinterpret_cast<const ElementBDataT*>(
+      static_cast<const char*>(b_base) + static_cast<int64_t>(b_row_offsets[g]) * K_packed);
+  ptr_SFA[g] = static_cast<const ElementSFT*>(sfa_base) + a_sf_offsets[g];
+  ptr_SFB[g] = static_cast<const ElementSFT*>(sfb_base) + b_sf_offsets[g];
+  ptr_D[g] = reinterpret_cast<ElementDT*>(
+      static_cast<char*>(d_base) +
+      static_cast<int64_t>(a_row_offsets[g]) * N * static_cast<int>(sizeof(ElementDT)));
+  ptr_alpha_a[g] = alpha_a_base + a_row_offsets[g];
+  ptr_alpha_b[g] = alpha_b_base + b_row_offsets[g];
+
+  stride_A[g] = cutlass::make_cute_packed_stride(StrideAT{}, {M_g, K, 1});
+  stride_B[g] = cutlass::make_cute_packed_stride(StrideBT{}, {N_g, K, 1});
+  stride_C[g] = cutlass::make_cute_packed_stride(StrideCT{}, {M_g, N_g, 1});
+  stride_D[g] = cutlass::make_cute_packed_stride(StrideDT{}, {M_g, N_g, 1});
+
+  auto shape_g = cute_::make_shape(M_g, N_g, K, 1);
+  layout_SFA[g] = BlkCfgT::tile_atom_to_shape_SFA(shape_g);
+  layout_SFB[g] = BlkCfgT::tile_atom_to_shape_SFB(shape_g);
+  problem_sizes[g] = cute_::make_shape(M_g, N_g, K);
+}
+
+// Dense launch: device fill of ptr-array metadata, then same Gemm as list path.
+// Requires uniform N across groups (encoded in D.size(1) / Ns[0]). No bias.
+// Prefix offset tables (a_row/b_row/a_sf/b_sf) are built on device from host Ms
+// when the caller passes nullptr; otherwise the provided device tables are used.
+template <bool Accumulate, class OverwriteGemmT = Gemm, class OverwriteEVTT = FusedEVT,
+          int ClusterM = 1>
+static void run_cutlass_grouped_per_token_gemm_dense_impl(
+    const void* a_base, const void* b_base, const void* a_sf_base, const void* b_sf_base,
+    const float* alpha_a_base, const float* alpha_b_base, void* d_base,
+    const int32_t* a_row_offsets, const int32_t* b_row_offsets, const int64_t* a_sf_offsets,
+    const int64_t* b_sf_offsets, const std::vector<int>& Ms, const std::vector<int>& Ns, int K,
+    float beta, cudaStream_t stream) {
+  using GemmT = std::conditional_t<Accumulate, GemmAcc, OverwriteGemmT>;
+  using StrideAT = typename GemmT::GemmKernel::InternalStrideA;
+  using StrideBT = typename GemmT::GemmKernel::InternalStrideB;
+  using StrideCT = typename GemmT::GemmKernel::InternalStrideC;
+  using StrideDT = typename GemmT::GemmKernel::InternalStrideD;
+  using LayoutSFAT = typename GemmT::GemmKernel::CollectiveMainloop::InternalLayoutSFA;
+  using LayoutSFBT = typename GemmT::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
+  using BlkCfgT = typename GemmT::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+  using ElementDT = std::conditional_t<Accumulate, ElementDAcc, ElementD>;
+
+  const int G = static_cast<int>(Ms.size());
+  NVTE_CHECK(G > 0 && G <= 1024, "dense grouped GEMM requires 1 <= num_groups <= 1024, got ", G);
+  NVTE_CHECK(K > 0 && (K % 2) == 0, "K must be positive and even (FP4 packed), got ", K);
+  NVTE_CHECK((K % 16) == 0, "K must be a multiple of 16 for SF packing, got ", K);
+  const int N = Ns[0];
+  for (int g = 0; g < G; ++g) {
+    NVTE_CHECK(Ns[g] == N, "dense grouped GEMM requires uniform N across groups; Ns[0]=", N,
+               " Ns[", g, "]=", Ns[g]);
+    NVTE_CHECK(Ms[g] > 0 && Ms[g] % 128 == 0 && Ns[g] % 128 == 0 && K % 128 == 0,
+               "group ", g, ": M/N/K must be positive multiples of 128");
+  }
+  const int K_packed = K / 2;
+  const int k_sf = K / 16;
+
+  const bool need_prefix = (a_row_offsets == nullptr || b_row_offsets == nullptr ||
+                            a_sf_offsets == nullptr || b_sf_offsets == nullptr);
+  NVTE_CHECK(!need_prefix || (a_row_offsets == nullptr && b_row_offsets == nullptr &&
+                              a_sf_offsets == nullptr && b_sf_offsets == nullptr),
+             "dense grouped GEMM offsets must be all provided or all nullptr");
+
+  // Persistent device scratch — filled by the kernels below (no H2D of ptr tables).
+  const size_t need =
+      align256(static_cast<size_t>(G) * sizeof(typename ProblemShape::UnderlyingProblemShape)) +
+      align256(static_cast<size_t>(G) * sizeof(StrideAT)) +
+      align256(static_cast<size_t>(G) * sizeof(StrideBT)) +
+      align256(static_cast<size_t>(G) * sizeof(StrideCT)) +
+      align256(static_cast<size_t>(G) * sizeof(StrideDT)) +
+      align256(static_cast<size_t>(G) * sizeof(LayoutSFAT)) +
+      align256(static_cast<size_t>(G) * sizeof(LayoutSFBT)) +
+      align256(static_cast<size_t>(G) * sizeof(const ElementADataT*)) +
+      align256(static_cast<size_t>(G) * sizeof(const ElementBDataT*)) +
+      align256(static_cast<size_t>(G) * sizeof(const ElementSFT*)) +
+      align256(static_cast<size_t>(G) * sizeof(const ElementSFT*)) +
+      align256(static_cast<size_t>(G) * sizeof(ElementDT*)) +
+      align256(static_cast<size_t>(G) * sizeof(const float*)) +
+      align256(static_cast<size_t>(G) * sizeof(const float*)) +
+      (need_prefix
+           ? (align256(static_cast<size_t>(G) * sizeof(int32_t)) +
+              align256(static_cast<size_t>(G + 1) * sizeof(int32_t)) +
+              align256(static_cast<size_t>(G + 1) * sizeof(int32_t)) +
+              align256(static_cast<size_t>(G + 1) * sizeof(int64_t)) +
+              align256(static_cast<size_t>(G + 1) * sizeof(int64_t)))
+           : 0);
+  uint8_t* scr = static_cast<uint8_t*>(persistent_buffer(need, stream, /*which=*/0));
+  size_t off = 0;
+  auto take = [&](size_t bytes) {
+    void* p = scr + off;
+    off += align256(bytes);
+    return p;
+  };
+  auto* problems_d =
+      static_cast<typename ProblemShape::UnderlyingProblemShape*>(take(
+          static_cast<size_t>(G) * sizeof(typename ProblemShape::UnderlyingProblemShape)));
+  auto* stride_A_d = static_cast<StrideAT*>(take(static_cast<size_t>(G) * sizeof(StrideAT)));
+  auto* stride_B_d = static_cast<StrideBT*>(take(static_cast<size_t>(G) * sizeof(StrideBT)));
+  auto* stride_C_d = static_cast<StrideCT*>(take(static_cast<size_t>(G) * sizeof(StrideCT)));
+  auto* stride_D_d = static_cast<StrideDT*>(take(static_cast<size_t>(G) * sizeof(StrideDT)));
+  auto* layout_SFA_d = static_cast<LayoutSFAT*>(take(static_cast<size_t>(G) * sizeof(LayoutSFAT)));
+  auto* layout_SFB_d = static_cast<LayoutSFBT*>(take(static_cast<size_t>(G) * sizeof(LayoutSFBT)));
+  auto* a_ptr_d =
+      static_cast<const ElementADataT**>(take(static_cast<size_t>(G) * sizeof(const ElementADataT*)));
+  auto* b_ptr_d =
+      static_cast<const ElementBDataT**>(take(static_cast<size_t>(G) * sizeof(const ElementBDataT*)));
+  auto* sfa_ptr_d =
+      static_cast<const ElementSFT**>(take(static_cast<size_t>(G) * sizeof(const ElementSFT*)));
+  auto* sfb_ptr_d =
+      static_cast<const ElementSFT**>(take(static_cast<size_t>(G) * sizeof(const ElementSFT*)));
+  auto* d_ptr_d = static_cast<ElementDT**>(take(static_cast<size_t>(G) * sizeof(ElementDT*)));
+  auto* alpha_a_d =
+      static_cast<const float**>(take(static_cast<size_t>(G) * sizeof(const float*)));
+  auto* alpha_b_d =
+      static_cast<const float**>(take(static_cast<size_t>(G) * sizeof(const float*)));
+
+  const int32_t* a_row_d = a_row_offsets;
+  const int32_t* b_row_d = b_row_offsets;
+  const int64_t* a_sf_d = a_sf_offsets;
+  const int64_t* b_sf_d = b_sf_offsets;
+  if (need_prefix) {
+    auto* m_splits_d = static_cast<int32_t*>(take(static_cast<size_t>(G) * sizeof(int32_t)));
+    auto* a_row_scratch =
+        static_cast<int32_t*>(take(static_cast<size_t>(G + 1) * sizeof(int32_t)));
+    auto* b_row_scratch =
+        static_cast<int32_t*>(take(static_cast<size_t>(G + 1) * sizeof(int32_t)));
+    auto* a_sf_scratch =
+        static_cast<int64_t*>(take(static_cast<size_t>(G + 1) * sizeof(int64_t)));
+    auto* b_sf_scratch =
+        static_cast<int64_t*>(take(static_cast<size_t>(G + 1) * sizeof(int64_t)));
+    NVTE_CHECK_CUDA(cudaMemcpyAsync(m_splits_d, Ms.data(), static_cast<size_t>(G) * sizeof(int32_t),
+                                    cudaMemcpyHostToDevice, stream));
+    fill_grouped_per_token_dense_prefix_offsets_kernel<<<1, G, static_cast<size_t>(G) * sizeof(int32_t),
+                                                         stream>>>(
+        m_splits_d, a_row_scratch, b_row_scratch, a_sf_scratch, b_sf_scratch, G, N, k_sf);
+    NVTE_CHECK_CUDA(cudaGetLastError());
+    a_row_d = a_row_scratch;
+    b_row_d = b_row_scratch;
+    a_sf_d = a_sf_scratch;
+    b_sf_d = b_sf_scratch;
+  }
+
+  fill_grouped_per_token_dense_args_kernel<StrideAT, StrideBT, StrideCT, StrideDT, LayoutSFAT,
+                                           LayoutSFBT, BlkCfgT, ElementDT>
+      <<<1, G, 0, stream>>>(a_ptr_d, b_ptr_d, sfa_ptr_d, sfb_ptr_d, d_ptr_d, alpha_a_d, alpha_b_d,
+                            stride_A_d, stride_B_d, stride_C_d, stride_D_d, layout_SFA_d,
+                            layout_SFB_d, problems_d, a_base, b_base, a_sf_base, b_sf_base, d_base,
+                            alpha_a_base, alpha_b_base, a_row_d, b_row_d, a_sf_d, b_sf_d, K_packed,
+                            K, N);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = 0;
+  hw_info.sm_count = cached_sm_count();
+  if constexpr (ClusterM == 2) {
+    hw_info.cluster_shape = dim3(2, 1, 1);
+    hw_info.cluster_shape_fallback = dim3(2, 1, 1);
+  }
+
+  GemmT gemm;
+  if constexpr (Accumulate) {
+    typename AccumEVT::Arguments fusion_args{
+        {/*scalars=*/{beta}, /*scalar_ptrs=*/{nullptr}, /*dScalar=*/{}},
+        {},
+        make_z_args<typename ScaledAccEVT::Arguments>(alpha_a_d, alpha_b_d),
+        {},
+    };
+    auto* c_ptr_d = reinterpret_cast<const ElementCAcc**>(reinterpret_cast<void*>(d_ptr_d));
+    typename GemmT::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {G, problems_d, /*host_problem_shapes=*/nullptr},
+        {a_ptr_d, stride_A_d, b_ptr_d, stride_B_d, sfa_ptr_d, layout_SFA_d, sfb_ptr_d,
+         layout_SFB_d},
+        {fusion_args, /*ptr_C=*/c_ptr_d, stride_C_d, d_ptr_d, stride_D_d},
+        hw_info};
+    run_grouped_gemm(gemm, args, G, stream);
+  } else {
+    typename OverwriteEVTT::Arguments fusion_args =
+        make_z_args<typename OverwriteEVTT::Arguments>(alpha_a_d, alpha_b_d);
+    typename GemmT::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {G, problems_d, /*host_problem_shapes=*/nullptr},
+        {a_ptr_d, stride_A_d, b_ptr_d, stride_B_d, sfa_ptr_d, layout_SFA_d, sfb_ptr_d,
+         layout_SFB_d},
+        {fusion_args, /*ptr_C=*/nullptr, stride_C_d, d_ptr_d, stride_D_d},
+        hw_info};
+    run_grouped_gemm(gemm, args, G, stream);
+  }
+}
+
 #endif  // CUTLASS_ARCH_MMA_SM100_SUPPORTED
 
 }  // namespace nvfp4_cutlass
@@ -733,6 +987,123 @@ void nvte_nvfp4_cutlass_grouped_per_token_gemm(int num_groups, const NVTETensor*
     nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_impl</*Accumulate=*/false>(
         a_data_ptrs, b_data_ptrs, a_sf_ptrs, b_sf_ptrs, alpha_a_ptrs, alpha_b_ptrs, bias_ptrs,
         d_ptrs, Ms, Ns, Ks, /*beta=*/0.0f, stream);
+  }
+#else
+  NVTE_ERROR(
+      "CUTLASS NVFP4 grouped per-token GEMM requires SM100 (Blackwell). Build with "
+      "sm_100a/sm_100f.");
+#endif
+}
+
+void nvte_nvfp4_cutlass_grouped_per_token_gemm_dense(
+    int num_groups, const NVTETensor a_data, const NVTETensor b_data, const NVTETensor a_sf,
+    const NVTETensor b_sf, const NVTETensor alpha_a, const NVTETensor alpha_b, NVTETensor d,
+    const int32_t* a_row_offsets, const int32_t* b_row_offsets, const int64_t* a_sf_offsets,
+    const int64_t* b_sf_offsets, const int32_t* m_splits, bool accumulate,
+    enum NVTENvfp4GroupedGemmKind gemm_kind, cudaStream_t stream) {
+  using namespace transformer_engine;
+
+  NVTE_CHECK(num_groups > 0, "num_groups must be positive, got ", num_groups);
+  NVTE_CHECK(gemm_kind == NVTE_NVFP4_GROUPED_GEMM_DEFAULT ||
+                 gemm_kind == NVTE_NVFP4_GROUPED_GEMM_FC1 ||
+                 gemm_kind == NVTE_NVFP4_GROUPED_GEMM_FC2,
+             "gemm_kind must be DEFAULT, FC1, or FC2, got ", static_cast<int>(gemm_kind));
+  NVTE_CHECK(m_splits != nullptr, "dense grouped GEMM requires host m_splits");
+  const bool have_offsets = a_row_offsets != nullptr || b_row_offsets != nullptr ||
+                            a_sf_offsets != nullptr || b_sf_offsets != nullptr;
+  if (have_offsets) {
+    NVTE_CHECK(a_row_offsets != nullptr && b_row_offsets != nullptr && a_sf_offsets != nullptr &&
+                   b_sf_offsets != nullptr,
+               "dense grouped GEMM offsets must be all provided or all nullptr");
+  }
+
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  auto* a_t = convertNVTETensorCheck(a_data);
+  auto* b_t = convertNVTETensorCheck(b_data);
+  auto* sa_t = convertNVTETensorCheck(a_sf);
+  auto* sb_t = convertNVTETensorCheck(b_sf);
+  auto* aa_t = convertNVTETensorCheck(alpha_a);
+  auto* ab_t = convertNVTETensorCheck(alpha_b);
+  auto* d_t = convertNVTETensorCheck(d);
+
+  NVTE_CHECK(a_t->data.shape.size() == 2 && b_t->data.shape.size() == 2 &&
+                 d_t->data.shape.size() == 2,
+             "dense grouped GEMM A/B/D must be 2D");
+  NVTE_CHECK(a_t->data.dtype == DType::kFloat4E2M1 && b_t->data.dtype == DType::kFloat4E2M1,
+             "dense grouped GEMM A/B must be FP4 e2m1");
+  NVTE_CHECK(aa_t->data.dtype == DType::kFloat32 && ab_t->data.dtype == DType::kFloat32,
+             "dense grouped GEMM alpha_a/alpha_b must be FP32");
+  NVTE_CHECK(d_t->data.dtype == DType::kBFloat16 || d_t->data.dtype == DType::kFloat32,
+             "dense grouped GEMM D must be BF16 or FP32");
+
+  const bool d_is_fp32 = d_t->data.dtype == DType::kFloat32;
+  NVTE_CHECK(!accumulate || d_is_fp32,
+             "dense grouped GEMM accumulate=true requires FP32 outputs");
+
+  const int sum_M = static_cast<int>(a_t->data.shape[0]);
+  const int K = static_cast<int>(a_t->data.shape[1]);
+  const int sum_N = static_cast<int>(b_t->data.shape[0]);
+  const int N = static_cast<int>(d_t->data.shape[1]);
+  NVTE_CHECK(static_cast<int>(b_t->data.shape[1]) == K, "dense grouped GEMM A.K/B.K mismatch");
+  NVTE_CHECK(static_cast<int>(d_t->data.shape[0]) == sum_M, "dense grouped GEMM D.M != A.M");
+  NVTE_CHECK(aa_t->data.numel() == static_cast<size_t>(sum_M), "alpha_a must be (sum_M,)");
+  NVTE_CHECK(ab_t->data.numel() == static_cast<size_t>(sum_N), "alpha_b must be (sum_N,)");
+
+  std::vector<int> Ms(num_groups), Ns(num_groups, N), Ks(num_groups, K);
+  int64_t acc_M = 0;
+  for (int g = 0; g < num_groups; ++g) {
+    Ms[g] = static_cast<int>(m_splits[g]);
+    NVTE_CHECK(Ms[g] > 0, "m_splits[", g, "] must be > 0");
+    acc_M += Ms[g];
+  }
+  NVTE_CHECK(acc_M == sum_M, "sum(m_splits)=", acc_M, " must equal A.size(0)=", sum_M);
+  NVTE_CHECK(sum_N == N * num_groups,
+             "dense grouped GEMM expects B packed as (G*N, K) with uniform N; got sum_N=", sum_N,
+             " G*N=", static_cast<int64_t>(N) * num_groups);
+
+  static const bool fc1_2sm_n256 =
+      transformer_engine::getenv<bool>("NVTE_NVFP4_GROUPED_FC1_2SM_N256", true);
+  static const bool fc1_1sm_n256 =
+      transformer_engine::getenv<bool>("NVTE_NVFP4_GROUPED_FC1_N256", false);
+
+  const void* a_base = a_t->data.dptr;
+  const void* b_base = b_t->data.dptr;
+  const void* a_sf_base = sa_t->data.dptr;
+  const void* b_sf_base = sb_t->data.dptr;
+  const float* alpha_a_base = reinterpret_cast<const float*>(aa_t->data.dptr);
+  const float* alpha_b_base = reinterpret_cast<const float*>(ab_t->data.dptr);
+  void* d_base = d_t->data.dptr;
+
+  if (d_is_fp32) {
+    nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_dense_impl</*Accumulate=*/true>(
+        a_base, b_base, a_sf_base, b_sf_base, alpha_a_base, alpha_b_base, d_base, a_row_offsets,
+        b_row_offsets, a_sf_offsets, b_sf_offsets, Ms, Ns, K,
+        /*beta=*/accumulate ? 1.0f : 0.0f, stream);
+  } else if (nvfp4_cutlass::should_use_alt_tile<NVTE_NVFP4_GROUPED_GEMM_FC1, /*CheckM=*/true,
+                                               /*CheckN=*/true>(gemm_kind, Ms, Ns, fc1_2sm_n256)) {
+    nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_dense_impl<
+        /*Accumulate=*/false, nvfp4_cutlass::Kernel2SmN256::Gemm,
+        nvfp4_cutlass::Kernel2SmN256::FusedEVT, /*ClusterM=*/2>(
+        a_base, b_base, a_sf_base, b_sf_base, alpha_a_base, alpha_b_base, d_base, a_row_offsets,
+        b_row_offsets, a_sf_offsets, b_sf_offsets, Ms, Ns, K, /*beta=*/0.0f, stream);
+  } else if (nvfp4_cutlass::should_use_alt_tile<NVTE_NVFP4_GROUPED_GEMM_FC2, /*CheckM=*/true,
+                                               /*CheckN=*/false>(gemm_kind, Ms, Ns, true)) {
+    nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_dense_impl<
+        /*Accumulate=*/false, nvfp4_cutlass::Kernel2SmN128::Gemm,
+        nvfp4_cutlass::Kernel2SmN128::FusedEVT, /*ClusterM=*/2>(
+        a_base, b_base, a_sf_base, b_sf_base, alpha_a_base, alpha_b_base, d_base, a_row_offsets,
+        b_row_offsets, a_sf_offsets, b_sf_offsets, Ms, Ns, K, /*beta=*/0.0f, stream);
+  } else if (nvfp4_cutlass::should_use_alt_tile<NVTE_NVFP4_GROUPED_GEMM_FC1, /*CheckM=*/false,
+                                               /*CheckN=*/true>(gemm_kind, Ms, Ns, fc1_1sm_n256)) {
+    nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_dense_impl<
+        /*Accumulate=*/false, nvfp4_cutlass::Kernel1SmN256::Gemm,
+        nvfp4_cutlass::Kernel1SmN256::FusedEVT, /*ClusterM=*/1>(
+        a_base, b_base, a_sf_base, b_sf_base, alpha_a_base, alpha_b_base, d_base, a_row_offsets,
+        b_row_offsets, a_sf_offsets, b_sf_offsets, Ms, Ns, K, /*beta=*/0.0f, stream);
+  } else {
+    nvfp4_cutlass::run_cutlass_grouped_per_token_gemm_dense_impl</*Accumulate=*/false>(
+        a_base, b_base, a_sf_base, b_sf_base, alpha_a_base, alpha_b_base, d_base, a_row_offsets,
+        b_row_offsets, a_sf_offsets, b_sf_offsets, Ms, Ns, K, /*beta=*/0.0f, stream);
   }
 #else
   NVTE_ERROR(

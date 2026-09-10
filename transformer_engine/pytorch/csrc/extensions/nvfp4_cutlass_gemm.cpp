@@ -397,4 +397,113 @@ void nvfp4_cutlass_grouped_per_token_gemm(
       kind, stream);
 }
 
+void nvfp4_cutlass_grouped_per_token_gemm_dense(
+    const at::Tensor &a_data, const at::Tensor &b_data, const at::Tensor &a_sf,
+    const at::Tensor &b_sf, const at::Tensor &alpha_a, const at::Tensor &alpha_b, at::Tensor d,
+    const std::optional<at::Tensor> &a_row_offsets, const std::optional<at::Tensor> &b_row_offsets,
+    const std::optional<at::Tensor> &a_sf_offsets, const std::optional<at::Tensor> &b_sf_offsets,
+    const std::vector<int64_t> &m_splits, bool accumulate, const std::string &gemm_kind) {
+  const NVTENvfp4GroupedGemmKind kind = parse_nvfp4_grouped_gemm_kind(gemm_kind);
+  const int64_t G = static_cast<int64_t>(m_splits.size());
+  TORCH_CHECK(G > 0, "dense grouped GEMM needs at least one group");
+  TORCH_CHECK(a_data.is_cuda() && b_data.is_cuda() && a_sf.is_cuda() && b_sf.is_cuda() &&
+                  alpha_a.is_cuda() && alpha_b.is_cuda() && d.is_cuda(),
+              "dense grouped GEMM operands must be CUDA tensors");
+  TORCH_CHECK(a_data.is_contiguous() && b_data.is_contiguous() && a_sf.is_contiguous() &&
+                  b_sf.is_contiguous() && alpha_a.is_contiguous() && alpha_b.is_contiguous() &&
+                  d.is_contiguous(),
+              "dense grouped GEMM operands must be contiguous");
+
+  const bool have_a = a_row_offsets.has_value();
+  const bool have_b = b_row_offsets.has_value();
+  const bool have_asf = a_sf_offsets.has_value();
+  const bool have_bsf = b_sf_offsets.has_value();
+  const bool have_any = have_a || have_b || have_asf || have_bsf;
+  const bool have_all = have_a && have_b && have_asf && have_bsf;
+  TORCH_CHECK(!have_any || have_all,
+              "dense offset tables must be all provided or all omitted");
+
+  const int32_t *a_row_ptr = nullptr;
+  const int32_t *b_row_ptr = nullptr;
+  const int64_t *a_sf_ptr = nullptr;
+  const int64_t *b_sf_ptr = nullptr;
+  if (have_all) {
+    const at::Tensor &a_row = a_row_offsets.value();
+    const at::Tensor &b_row = b_row_offsets.value();
+    const at::Tensor &a_sf_off = a_sf_offsets.value();
+    const at::Tensor &b_sf_off = b_sf_offsets.value();
+    TORCH_CHECK(a_row.is_cuda() && b_row.is_cuda() && a_sf_off.is_cuda() && b_sf_off.is_cuda(),
+                "offset tables must be CUDA tensors");
+    TORCH_CHECK(a_row.scalar_type() == at::kInt && b_row.scalar_type() == at::kInt,
+                "a_row_offsets/b_row_offsets must be int32");
+    TORCH_CHECK(a_sf_off.scalar_type() == at::kLong && b_sf_off.scalar_type() == at::kLong,
+                "a_sf_offsets/b_sf_offsets must be int64");
+    TORCH_CHECK(a_row.numel() == G + 1 && b_row.numel() == G + 1 && a_sf_off.numel() == G + 1 &&
+                    b_sf_off.numel() == G + 1,
+                "offset tables must have length num_groups+1");
+    a_row_ptr = a_row.data_ptr<int32_t>();
+    b_row_ptr = b_row.data_ptr<int32_t>();
+    a_sf_ptr = a_sf_off.data_ptr<int64_t>();
+    b_sf_ptr = b_sf_off.data_ptr<int64_t>();
+  }
+
+  TORCH_CHECK(a_data.scalar_type() == at::ScalarType::Byte &&
+                  b_data.scalar_type() == at::ScalarType::Byte,
+              "a_data/b_data must be uint8 (FP4 packed)");
+  TORCH_CHECK(d.scalar_type() == at::ScalarType::BFloat16 ||
+                  d.scalar_type() == at::ScalarType::Float,
+              "d must be bf16 or float32");
+  TORCH_CHECK(alpha_a.scalar_type() == at::ScalarType::Float &&
+                  alpha_b.scalar_type() == at::ScalarType::Float,
+              "alpha_a/alpha_b must be float32");
+  TORCH_CHECK(a_data.dim() == 2 && b_data.dim() == 2 && d.dim() == 2, "A/B/D must be 2D");
+
+  const int64_t sum_M = a_data.size(0);
+  const int64_t K = a_data.size(1) * 2;
+  const int64_t sum_N = b_data.size(0);
+  const int64_t N = d.size(1);
+  TORCH_CHECK(b_data.size(1) * 2 == K, "A.K/B.K mismatch");
+  TORCH_CHECK(d.size(0) == sum_M, "D.M must equal A.M (sum_M)");
+  TORCH_CHECK(alpha_a.numel() == sum_M, "alpha_a must be (sum_M,)");
+  TORCH_CHECK(alpha_b.numel() == sum_N, "alpha_b must be (sum_N,)");
+  TORCH_CHECK(sum_N == N * G, "B must be packed as (G*N, K/2) with uniform N");
+
+  std::vector<int32_t> m_splits_i32(static_cast<size_t>(G));
+  int64_t acc = 0;
+  for (int64_t g = 0; g < G; ++g) {
+    TORCH_CHECK(m_splits[g] > 0, "m_splits[", g, "] must be > 0");
+    m_splits_i32[static_cast<size_t>(g)] = static_cast<int32_t>(m_splits[g]);
+    acc += m_splits[g];
+  }
+  TORCH_CHECK(acc == sum_M, "sum(m_splits) must equal A.size(0)");
+
+  const bool d_is_fp32 = d.scalar_type() == at::ScalarType::Float;
+  TORCH_CHECK(!accumulate || d_is_fp32, "accumulate=true requires float32 d");
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const std::vector<size_t> a_shape = {static_cast<size_t>(sum_M), static_cast<size_t>(K)};
+  const std::vector<size_t> b_shape = {static_cast<size_t>(sum_N), static_cast<size_t>(K)};
+  const std::vector<size_t> d_shape = {static_cast<size_t>(sum_M), static_cast<size_t>(N)};
+
+  TensorWrapper a_te =
+      makeTransformerEngineTensor(a_data.data_ptr(), a_shape, DType::kFloat4E2M1);
+  TensorWrapper b_te =
+      makeTransformerEngineTensor(b_data.data_ptr(), b_shape, DType::kFloat4E2M1);
+  TensorWrapper a_sf_te = makeTransformerEngineTensor(
+      a_sf.data_ptr(), std::vector<size_t>{static_cast<size_t>(a_sf.numel())}, DType::kFloat8E4M3);
+  TensorWrapper b_sf_te = makeTransformerEngineTensor(
+      b_sf.data_ptr(), std::vector<size_t>{static_cast<size_t>(b_sf.numel())}, DType::kFloat8E4M3);
+  TensorWrapper aa_te = makeTransformerEngineTensor(
+      alpha_a.data_ptr(), std::vector<size_t>{static_cast<size_t>(sum_M)}, DType::kFloat32);
+  TensorWrapper ab_te = makeTransformerEngineTensor(
+      alpha_b.data_ptr(), std::vector<size_t>{static_cast<size_t>(sum_N)}, DType::kFloat32);
+  TensorWrapper d_te = makeTransformerEngineTensor(
+      d.data_ptr(), d_shape, d_is_fp32 ? DType::kFloat32 : DType::kBFloat16);
+
+  nvte_nvfp4_cutlass_grouped_per_token_gemm_dense(
+      static_cast<int>(G), a_te.data(), b_te.data(), a_sf_te.data(), b_sf_te.data(), aa_te.data(),
+      ab_te.data(), d_te.data(), a_row_ptr, b_row_ptr, a_sf_ptr, b_sf_ptr, m_splits_i32.data(),
+      accumulate, kind, stream);
+}
+
 }  // namespace transformer_engine::pytorch

@@ -12,6 +12,7 @@
 #define TRANSFORMER_ENGINE_NVFP4_CUTLASS_GEMM_H_
 
 #include <cuda_runtime_api.h>
+#include <stdint.h>
 
 #include "transformer_engine.h"
 
@@ -89,6 +90,39 @@ void nvte_nvfp4_cutlass_grouped_per_token_gemm(int num_groups, const NVTETensor 
                                                const NVTETensor *bias, bool accumulate,
                                                enum NVTENvfp4GroupedGemmKind gemm_kind,
                                                cudaStream_t stream);
+
+/*! \brief Dense / contiguous-offset entry for grouped per-token NVFP4 GEMM.
+ *
+ *  Same math and CUTLASS PtrArray kernels as
+ *  nvte_nvfp4_cutlass_grouped_per_token_gemm, but operands are single
+ *  concatenated device tensors plus device offset tables. Per-group ptr /
+ *  stride / layout / problem-size metadata is filled on device (no host
+ *  list-of-tensors → H2D metadata path).
+ *
+ *  Layout assumptions (MoE TN fprop):
+ *    - a_data : FP4 packed, contiguous rows, logical (sum_M, K)
+ *    - b_data : FP4 packed, contiguous along expert N, logical (sum_N, K)
+ *               with sum_N = sum_g N_g (usually G * N)
+ *    - a_sf / b_sf : already GEMM-swizzled SF, concat along the same axis;
+ *                    a_sf_offsets[g] / b_sf_offsets[g] are element offsets
+ *    - alpha_a : FP32 (sum_M,), alpha_b : FP32 (sum_N,)
+ *    - d : BF16 or FP32 (sum_M, N_uniform). All groups share the same N
+ *          (N_g == N for every g); M_g may vary.
+ *    - a_row_offsets / b_row_offsets : int32 device [num_groups+1], exclusive
+ *      prefix sums of M_g / N_g (b_row also indexes alpha_b / B rows).
+ *      May be nullptr: then filled on device from m_splits (stride N, k_sf=K/16).
+ *    - a_sf_offsets / b_sf_offsets : int64 device [num_groups+1]
+ *      May be nullptr together with the row offsets (all-or-nothing).
+ *    - m_splits : host int32 [num_groups] with M_g (for tile dispatch / checks)
+ *
+ *  Bias is not supported on this entry (pass accumulate + gemm_kind only).
+ *  SFs must already be swizzled. Empty experts (M_g==0) must be filtered out. */
+void nvte_nvfp4_cutlass_grouped_per_token_gemm_dense(
+    int num_groups, const NVTETensor a_data, const NVTETensor b_data, const NVTETensor a_sf,
+    const NVTETensor b_sf, const NVTETensor alpha_a, const NVTETensor alpha_b, NVTETensor d,
+    const int32_t *a_row_offsets, const int32_t *b_row_offsets, const int64_t *a_sf_offsets,
+    const int64_t *b_sf_offsets, const int32_t *m_splits, bool accumulate,
+    enum NVTENvfp4GroupedGemmKind gemm_kind, cudaStream_t stream);
 
 #ifdef __cplusplus
 }  // extern "C"
