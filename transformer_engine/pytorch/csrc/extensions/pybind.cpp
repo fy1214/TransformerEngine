@@ -521,6 +521,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("alpha_b"), py::arg("d"), py::arg("a_sf_swizzled") = false,
         py::arg("b_sf_swizzled") = false, py::arg("accumulate") = false,
         py::arg("bias") = std::vector<at::Tensor>(), py::arg("gemm_kind") = "default");
+  m.def("nvfp4_cutlass_grouped_per_token_gemm_dense",
+        &transformer_engine::pytorch::nvfp4_cutlass_grouped_per_token_gemm_dense,
+        "Dense/contiguous-offset twin of nvfp4_cutlass_grouped_per_token_gemm. "
+        "A/B/SF/alpha/D are concatenated tensors. Offset tables are optional: when "
+        "omitted, TE fills a_row/b_row/a_sf/b_sf on device from m_splits (uniform N, "
+        "k_sf=K/16). Metadata ptr tables are filled on device (no list H2D). Requires "
+        "already swizzled SFs, uniform N (B/alpha_b packed as G*N), and host m_splits. "
+        "No bias on this entry. gemm_kind is 'default'|'fc1'|'fc2'.",
+        py::arg("a_data"), py::arg("b_data"), py::arg("a_sf"), py::arg("b_sf"), py::arg("alpha_a"),
+        py::arg("alpha_b"), py::arg("d"), py::arg("a_row_offsets") = py::none(),
+        py::arg("b_row_offsets") = py::none(), py::arg("a_sf_offsets") = py::none(),
+        py::arg("b_sf_offsets") = py::none(), py::arg("m_splits"),
+        py::arg("accumulate") = false, py::arg("gemm_kind") = "default");
   m.def("nvfp4_per_token_post_scale", &transformer_engine::pytorch::nvfp4_per_token_post_scale,
         "Apply d[i,j] *= row_amax_a[i] * row_amax_b[j] in-place on bf16 D.", py::arg("d"),
         py::arg("row_amax_a"), py::arg("row_amax_b"));
@@ -567,12 +580,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("with_rht") = false, py::arg("random_sign_mask_t") = static_cast<int64_t>(0xACE1));
   m.def("nvfp4_per_token_group_quantize_bulk",
         &transformer_engine::pytorch::nvfp4_per_token_group_quantize_bulk,
-        "Bulk grouped quantize: allocates per-split buffers + view-slices inside "
-        "the binding (one pybind hop instead of 1 + 6N), then dispatches the K1+K2 "
-        "kernel. with_rht=True applies a 16-pt col-wise RHT in both K1 and K2. "
-        "with_swizzle=True writes rowwise scale_inv directly in the swizzled layout. "
-        "do_amax=False skips K1; pass precomputed row_amax (sum_M,) and/or "
-        "col_amax (num_tensors, K).",
+        "Bulk grouped quantize: allocates dense buffers and dispatches K1+K2 "
+        "via raw pointer offsets (no narrow for the kernel). Returns per-split "
+        "views for compatibility. Prefer nvfp4_per_token_group_quantize_bulk_dense "
+        "to skip the view packaging. with_swizzle=True writes rowwise scale_inv "
+        "in the swizzled layout. do_amax=False skips K1; pass precomputed "
+        "row_amax (sum_M,) and/or col_amax (num_tensors, K).",
+        py::arg("input"), py::arg("split_sections"), py::arg("rowwise"), py::arg("columnwise"),
+        py::arg("with_rht") = false, py::arg("random_sign_mask_t") = static_cast<int64_t>(0xACE1),
+        py::arg("with_swizzle") = false, py::arg("do_amax") = true,
+        py::arg("row_amax") = py::none(), py::arg("col_amax") = py::none());
+  m.def("nvfp4_per_token_group_quantize_bulk_dense",
+        &transformer_engine::pytorch::nvfp4_per_token_group_quantize_bulk_dense,
+        "Dense twin of nvfp4_per_token_group_quantize_bulk: returns concatenated "
+        "q_row / s_dec_row_fp8 / row_amax / q_col / s_dec_col_fp8 / col_amax with "
+        "no per-expert aten::narrow. Disabled directions return empty tensors.",
         py::arg("input"), py::arg("split_sections"), py::arg("rowwise"), py::arg("columnwise"),
         py::arg("with_rht") = false, py::arg("random_sign_mask_t") = static_cast<int64_t>(0xACE1),
         py::arg("with_swizzle") = false, py::arg("do_amax") = true,

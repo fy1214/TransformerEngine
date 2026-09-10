@@ -575,6 +575,36 @@ void build_per_token_output_wrapper(TensorWrapper& out_te, int64_t M_i, int64_t 
   }
 }
 
+// Same binding as above, but takes raw pointers into a concatenated bulk buffer
+// (no at::Tensor::narrow / view). Used by the dense bulk quantize entry.
+void build_per_token_output_wrapper_ptrs(TensorWrapper& out_te, int64_t M_i, int64_t K,
+                                         bool rowwise, bool columnwise, void* q_row,
+                                         void* s_dec_row, void* row_amax, void* q_col,
+                                         void* s_dec_col, void* col_amax) {
+  if (rowwise) {
+    TORCH_CHECK(q_row != nullptr && s_dec_row != nullptr && row_amax != nullptr,
+                "rowwise dense bulk requires q_row/s_dec_row/row_amax pointers");
+    out_te.set_rowwise_data(q_row, DType::kFloat4E2M1,
+                            std::vector<size_t>{static_cast<size_t>(M_i), static_cast<size_t>(K)});
+    out_te.set_rowwise_scale_inv(
+        s_dec_row, DType::kFloat8E4M3,
+        std::vector<size_t>{static_cast<size_t>(M_i), static_cast<size_t>(K / 16)});
+    out_te.set_amax(row_amax, DType::kFloat32, std::vector<size_t>{static_cast<size_t>(M_i)});
+  }
+  if (columnwise) {
+    TORCH_CHECK(q_col != nullptr && s_dec_col != nullptr && col_amax != nullptr,
+                "columnwise dense bulk requires q_col/s_dec_col/col_amax pointers");
+    out_te.set_columnwise_data(
+        q_col, DType::kFloat4E2M1,
+        std::vector<size_t>{static_cast<size_t>(K), static_cast<size_t>(M_i)});
+    out_te.set_columnwise_scale_inv(
+        s_dec_col, DType::kFloat8E4M3,
+        std::vector<size_t>{static_cast<size_t>(K), static_cast<size_t>(M_i / 16)});
+    out_te.set_columnwise_amax(col_amax, DType::kFloat32,
+                               std::vector<size_t>{static_cast<size_t>(K)});
+  }
+}
+
 DType resolve_input_dtype(const at::Tensor& input) {
   if (input.scalar_type() == at::ScalarType::BFloat16) return DType::kBFloat16;
   if (input.scalar_type() == at::ScalarType::Float) return DType::kFloat32;
@@ -730,18 +760,23 @@ void nvfp4_per_token_group_amax(const at::Tensor& input, const std::vector<int64
                                   static_cast<int>(random_sign_mask_t), stream);
 }
 
-// BULK grouped per-token quantize: alloc + view + dispatch in ONE C++ call.
-// Returns 6 per-split tensor lists (s_dec_* pre-cast to Float8_e4m3fn).
-// Byte-equal to the prior Python wrap (saves ~70-90us at N=8).
-std::tuple<std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Tensor>,
-           std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Tensor>>
-nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
-                                    const std::vector<int64_t>& split_sections, bool rowwise,
-                                    bool columnwise, bool with_rht, int64_t random_sign_mask_t,
-                                    bool with_swizzle, bool do_amax,
-                                    const std::optional<at::Tensor>& row_amax,
-                                    const std::optional<at::Tensor>& col_amax) {
-  // Validation mirrors _validate_per_token_group_input in Python.
+// Shared alloc + ptr-offset dispatch for bulk grouped per-token quantize.
+// No at::narrow / view. Returns dense buffers (empty tensor if direction off).
+// s_dec_* are returned as Float8_e4m3fn views of the uint8 storage (one view
+// per bulk buffer, not per expert).
+struct BulkQuantizeDenseOut {
+  at::Tensor q_row;
+  at::Tensor s_dec_row_fp8;
+  at::Tensor row_amax;
+  at::Tensor q_col;
+  at::Tensor s_dec_col_fp8;
+  at::Tensor col_amax;
+};
+
+BulkQuantizeDenseOut run_nvfp4_per_token_group_quantize_bulk_dense_impl(
+    const at::Tensor& input, const std::vector<int64_t>& split_sections, bool rowwise,
+    bool columnwise, bool with_rht, int64_t random_sign_mask_t, bool with_swizzle, bool do_amax,
+    const std::optional<at::Tensor>& row_amax, const std::optional<at::Tensor>& col_amax) {
   TORCH_CHECK(rowwise || columnwise, "At least one of rowwise/columnwise must be True.");
   TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
   TORCH_CHECK(input.is_contiguous(), "x_concat must be contiguous (row-major)");
@@ -773,88 +808,48 @@ nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
   }
   TORCH_CHECK(acc == sum_M, "sum(split_sections) = ", acc, " must equal input.size(0) = ", sum_M);
 
-  // Bulk allocation: one at::empty per output type, covers all splits.
   auto opts_u8 = input.options().dtype(at::kByte);
   auto opts_f32 = input.options().dtype(at::kFloat);
 
-  at::Tensor q_row_bulk, s_dec_row_bulk, row_amax_bulk;
-  at::Tensor q_col_bulk, s_dec_col_bulk, col_amax_bulk;
+  BulkQuantizeDenseOut out;
+  at::Tensor s_dec_row_u8, s_dec_col_u8;
 
   if (rowwise) {
-    q_row_bulk = at::empty({sum_M, K / 2}, opts_u8);
-    s_dec_row_bulk = at::empty({sum_M, K / kBlockK}, opts_u8);
+    out.q_row = at::empty({sum_M, K / 2}, opts_u8);
+    s_dec_row_u8 = at::empty({sum_M, K / kBlockK}, opts_u8);
     if (do_amax) {
-      row_amax_bulk = at::empty({sum_M}, opts_f32);
+      out.row_amax = at::empty({sum_M}, opts_f32);
     } else {
       TORCH_CHECK(row_amax.has_value(),
                   "do_amax=False requires a precomputed row_amax of shape (sum_M,)");
-      row_amax_bulk = row_amax.value();
-      TORCH_CHECK(row_amax_bulk.is_cuda() && row_amax_bulk.is_contiguous(),
+      out.row_amax = row_amax.value();
+      TORCH_CHECK(out.row_amax.is_cuda() && out.row_amax.is_contiguous(),
                   "row_amax must be a contiguous CUDA tensor");
-      TORCH_CHECK(row_amax_bulk.scalar_type() == at::ScalarType::Float, "row_amax must be float32");
-      TORCH_CHECK(row_amax_bulk.numel() == sum_M, "row_amax numel mismatch: expected ", sum_M,
-                  ", got ", row_amax_bulk.numel());
+      TORCH_CHECK(out.row_amax.scalar_type() == at::ScalarType::Float, "row_amax must be float32");
+      TORCH_CHECK(out.row_amax.numel() == sum_M, "row_amax numel mismatch: expected ", sum_M,
+                  ", got ", out.row_amax.numel());
     }
   }
   if (columnwise) {
-    q_col_bulk = at::empty({K * sum_M / 2}, opts_u8);
-    s_dec_col_bulk = at::empty({K * sum_M / kBlockK}, opts_u8);
+    out.q_col = at::empty({K * sum_M / 2}, opts_u8);
+    s_dec_col_u8 = at::empty({K * sum_M / kBlockK}, opts_u8);
     if (do_amax) {
-      col_amax_bulk = at::empty({static_cast<int64_t>(num_tensors), K}, opts_f32);
+      out.col_amax = at::empty({static_cast<int64_t>(num_tensors), K}, opts_f32);
     } else {
       TORCH_CHECK(col_amax.has_value(),
                   "do_amax=False requires a precomputed col_amax of shape (num_tensors, K)");
-      col_amax_bulk = col_amax.value();
-      TORCH_CHECK(col_amax_bulk.is_cuda() && col_amax_bulk.is_contiguous(),
+      out.col_amax = col_amax.value();
+      TORCH_CHECK(out.col_amax.is_cuda() && out.col_amax.is_contiguous(),
                   "col_amax must be a contiguous CUDA tensor");
-      TORCH_CHECK(col_amax_bulk.scalar_type() == at::ScalarType::Float, "col_amax must be float32");
-      TORCH_CHECK(col_amax_bulk.dim() == 2 &&
-                      col_amax_bulk.size(0) == static_cast<int64_t>(num_tensors) &&
-                      col_amax_bulk.size(1) == K,
+      TORCH_CHECK(out.col_amax.scalar_type() == at::ScalarType::Float, "col_amax must be float32");
+      TORCH_CHECK(out.col_amax.dim() == 2 &&
+                      out.col_amax.size(0) == static_cast<int64_t>(num_tensors) &&
+                      out.col_amax.size(1) == K,
                   "col_amax shape mismatch: expected (", num_tensors, ", ", K, "), got ",
-                  col_amax_bulk.sizes());
+                  out.col_amax.sizes());
     }
   }
 
-  // Per-split views built in C++; s_dec_* kept in both uint8 (for binding)
-  // and fp8_e4m3fn (returned to Python directly).
-  std::vector<at::Tensor> q_row_list, s_dec_row_u8_list, row_amax_list;
-  std::vector<at::Tensor> q_col_list, s_dec_col_u8_list, col_amax_list;
-  std::vector<at::Tensor> s_dec_row_fp8_list, s_dec_col_fp8_list;
-  if (rowwise) {
-    q_row_list.reserve(num_tensors);
-    s_dec_row_u8_list.reserve(num_tensors);
-    row_amax_list.reserve(num_tensors);
-    s_dec_row_fp8_list.reserve(num_tensors);
-  }
-  if (columnwise) {
-    q_col_list.reserve(num_tensors);
-    s_dec_col_u8_list.reserve(num_tensors);
-    col_amax_list.reserve(num_tensors);
-    s_dec_col_fp8_list.reserve(num_tensors);
-  }
-
-  int64_t m_off = 0;
-  for (size_t i = 0; i < num_tensors; ++i) {
-    const int64_t M_i = split_sections[i];
-    if (rowwise) {
-      q_row_list.emplace_back(q_row_bulk.narrow(0, m_off, M_i));
-      s_dec_row_u8_list.emplace_back(s_dec_row_bulk.narrow(0, m_off, M_i));
-      row_amax_list.emplace_back(row_amax_bulk.narrow(0, m_off, M_i));
-      s_dec_row_fp8_list.emplace_back(s_dec_row_u8_list.back().view(at::kFloat8_e4m3fn));
-    }
-    if (columnwise) {
-      auto q_col_flat = q_col_bulk.narrow(0, K * m_off / 2, K * M_i / 2);
-      q_col_list.emplace_back(q_col_flat.view({K, M_i / 2}));
-      auto s_dec_col_flat = s_dec_col_bulk.narrow(0, K * m_off / kBlockK, K * M_i / kBlockK);
-      s_dec_col_u8_list.emplace_back(s_dec_col_flat.view({K, M_i / kBlockK}));
-      col_amax_list.emplace_back(col_amax_bulk.select(0, static_cast<int64_t>(i)));
-      s_dec_col_fp8_list.emplace_back(s_dec_col_u8_list.back().view(at::kFloat8_e4m3fn));
-    }
-    m_off += M_i;
-  }
-
-  // Dispatch grouped kernel via the same C-API the thin entry uses.
   const auto stream = at::cuda::getCurrentCUDAStream();
   TensorWrapper in_te = makeTransformerEngineTensor(
       input.data_ptr(), std::vector<size_t>{static_cast<size_t>(sum_M), static_cast<size_t>(K)},
@@ -866,18 +861,40 @@ nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
   handles.reserve(num_tensors);
   std::vector<size_t> split_sections_sz(num_tensors);
 
-  at::Tensor empty_dummy;
+  auto* q_row_base =
+      rowwise ? static_cast<uint8_t*>(out.q_row.data_ptr()) : nullptr;
+  auto* s_row_base =
+      rowwise ? static_cast<uint8_t*>(s_dec_row_u8.data_ptr()) : nullptr;
+  auto* amax_row_base =
+      rowwise ? static_cast<float*>(out.row_amax.data_ptr()) : nullptr;
+  auto* q_col_base =
+      columnwise ? static_cast<uint8_t*>(out.q_col.data_ptr()) : nullptr;
+  auto* s_col_base =
+      columnwise ? static_cast<uint8_t*>(s_dec_col_u8.data_ptr()) : nullptr;
+  auto* amax_col_base =
+      columnwise ? static_cast<float*>(out.col_amax.data_ptr()) : nullptr;
+
+  int64_t m_off = 0;
   for (size_t i = 0; i < num_tensors; ++i) {
     const int64_t M_i = split_sections[i];
     split_sections_sz[i] = static_cast<size_t>(M_i);
     wrappers.emplace_back(NVTE_NVFP4_1D_SCALING);
-    build_per_token_output_wrapper(
-        wrappers.back(), M_i, K, rowwise, columnwise, rowwise ? q_row_list[i] : empty_dummy,
-        rowwise ? s_dec_row_u8_list[i] : empty_dummy, rowwise ? row_amax_list[i] : empty_dummy,
-        columnwise ? q_col_list[i] : empty_dummy, columnwise ? s_dec_col_u8_list[i] : empty_dummy,
-        columnwise ? col_amax_list[i] : empty_dummy);
+    void* q_row_i =
+        rowwise ? static_cast<void*>(q_row_base + m_off * (K / 2)) : nullptr;
+    void* s_row_i =
+        rowwise ? static_cast<void*>(s_row_base + m_off * (K / kBlockK)) : nullptr;
+    void* amax_row_i = rowwise ? static_cast<void*>(amax_row_base + m_off) : nullptr;
+    void* q_col_i =
+        columnwise ? static_cast<void*>(q_col_base + (K * m_off / 2)) : nullptr;
+    void* s_col_i =
+        columnwise ? static_cast<void*>(s_col_base + (K * m_off / kBlockK)) : nullptr;
+    void* amax_col_i =
+        columnwise ? static_cast<void*>(amax_col_base + static_cast<int64_t>(i) * K) : nullptr;
+    build_per_token_output_wrapper_ptrs(wrappers.back(), M_i, K, rowwise, columnwise, q_row_i,
+                                        s_row_i, amax_row_i, q_col_i, s_col_i, amax_col_i);
     if (with_swizzle) wrappers.back().set_with_gemm_swizzled_scales(true);
     handles.push_back(wrappers.back().data());
+    m_off += M_i;
   }
 
   if (do_amax) {
@@ -892,9 +909,90 @@ nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
                                     /*with_sr=*/0, /*rng_state=*/nullptr, stream);
   }
 
+  if (rowwise) {
+    out.s_dec_row_fp8 = s_dec_row_u8.view(at::kFloat8_e4m3fn);
+  }
+  if (columnwise) {
+    // Keep flat storage; consumers that need (K, M_i/kBlockK) can view per split.
+    out.s_dec_col_fp8 = s_dec_col_u8.view(at::kFloat8_e4m3fn);
+  }
+  return out;
+}
+
+// BULK grouped per-token quantize: alloc + dispatch in ONE C++ call.
+// Returns 6 per-split tensor lists for backward compatibility (views into the
+// dense buffers). Prefer nvfp4_per_token_group_quantize_bulk_dense to avoid
+// the per-expert aten::narrow/view packaging.
+std::tuple<std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Tensor>,
+           std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Tensor>>
+nvfp4_per_token_group_quantize_bulk(const at::Tensor& input,
+                                    const std::vector<int64_t>& split_sections, bool rowwise,
+                                    bool columnwise, bool with_rht, int64_t random_sign_mask_t,
+                                    bool with_swizzle, bool do_amax,
+                                    const std::optional<at::Tensor>& row_amax,
+                                    const std::optional<at::Tensor>& col_amax) {
+  auto dense = run_nvfp4_per_token_group_quantize_bulk_dense_impl(
+      input, split_sections, rowwise, columnwise, with_rht, random_sign_mask_t, with_swizzle,
+      do_amax, row_amax, col_amax);
+
+  const size_t num_tensors = split_sections.size();
+  const int64_t K = input.size(1);
+  constexpr int64_t kBlockK = 16;
+
+  std::vector<at::Tensor> q_row_list, s_dec_row_fp8_list, row_amax_list;
+  std::vector<at::Tensor> q_col_list, s_dec_col_fp8_list, col_amax_list;
+  if (rowwise) {
+    q_row_list.reserve(num_tensors);
+    s_dec_row_fp8_list.reserve(num_tensors);
+    row_amax_list.reserve(num_tensors);
+  }
+  if (columnwise) {
+    q_col_list.reserve(num_tensors);
+    s_dec_col_fp8_list.reserve(num_tensors);
+    col_amax_list.reserve(num_tensors);
+  }
+
+  // Compat packaging only: per-expert views of the dense buffers.
+  int64_t m_off = 0;
+  for (size_t i = 0; i < num_tensors; ++i) {
+    const int64_t M_i = split_sections[i];
+    if (rowwise) {
+      q_row_list.emplace_back(dense.q_row.narrow(0, m_off, M_i));
+      s_dec_row_fp8_list.emplace_back(dense.s_dec_row_fp8.narrow(0, m_off, M_i));
+      row_amax_list.emplace_back(dense.row_amax.narrow(0, m_off, M_i));
+    }
+    if (columnwise) {
+      auto q_col_flat = dense.q_col.narrow(0, K * m_off / 2, K * M_i / 2);
+      q_col_list.emplace_back(q_col_flat.view({K, M_i / 2}));
+      // s_dec_col_fp8 is a flat view of uint8 bulk; recover u8 geometry via narrow on
+      // the underlying storage by viewing as uint8 first when needed.
+      auto s_u8 = dense.s_dec_col_fp8.view(at::kByte);
+      auto s_flat = s_u8.narrow(0, K * m_off / kBlockK, K * M_i / kBlockK);
+      s_dec_col_fp8_list.emplace_back(s_flat.view({K, M_i / kBlockK}).view(at::kFloat8_e4m3fn));
+      col_amax_list.emplace_back(dense.col_amax.select(0, static_cast<int64_t>(i)));
+    }
+    m_off += M_i;
+  }
+
   return std::make_tuple(std::move(q_row_list), std::move(s_dec_row_fp8_list),
                          std::move(row_amax_list), std::move(q_col_list),
                          std::move(s_dec_col_fp8_list), std::move(col_amax_list));
+}
+
+// Dense twin: returns concatenated buffers, no per-expert aten::narrow.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+nvfp4_per_token_group_quantize_bulk_dense(const at::Tensor& input,
+                                          const std::vector<int64_t>& split_sections, bool rowwise,
+                                          bool columnwise, bool with_rht,
+                                          int64_t random_sign_mask_t, bool with_swizzle,
+                                          bool do_amax, const std::optional<at::Tensor>& row_amax,
+                                          const std::optional<at::Tensor>& col_amax) {
+  auto dense = run_nvfp4_per_token_group_quantize_bulk_dense_impl(
+      input, split_sections, rowwise, columnwise, with_rht, random_sign_mask_t, with_swizzle,
+      do_amax, row_amax, col_amax);
+  return std::make_tuple(std::move(dense.q_row), std::move(dense.s_dec_row_fp8),
+                         std::move(dense.row_amax), std::move(dense.q_col),
+                         std::move(dense.s_dec_col_fp8), std::move(dense.col_amax));
 }
 
 }  // namespace transformer_engine::pytorch

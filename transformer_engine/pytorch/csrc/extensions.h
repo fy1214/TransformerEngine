@@ -510,6 +510,19 @@ void nvfp4_cutlass_grouped_per_token_gemm(
     std::vector<at::Tensor> d, bool a_sf_swizzled, bool b_sf_swizzled, bool accumulate,
     std::vector<at::Tensor> bias = {}, const std::string &gemm_kind = "default");
 
+// Dense / contiguous-offset twin of nvfp4_cutlass_grouped_per_token_gemm.
+// Operands are concatenated tensors. Offset tables are optional: when omitted
+// (or all None), TE fills a_row/b_row/a_sf/b_sf on device from m_splits
+// (uniform N, k_sf=K/16). SFs must already be swizzled. Uniform N across
+// groups; B/alpha_b packed as (G*N, ...). No bias on this entry.
+void nvfp4_cutlass_grouped_per_token_gemm_dense(
+    const at::Tensor &a_data, const at::Tensor &b_data, const at::Tensor &a_sf,
+    const at::Tensor &b_sf, const at::Tensor &alpha_a, const at::Tensor &alpha_b, at::Tensor d,
+    const std::optional<at::Tensor> &a_row_offsets, const std::optional<at::Tensor> &b_row_offsets,
+    const std::optional<at::Tensor> &a_sf_offsets, const std::optional<at::Tensor> &b_sf_offsets,
+    const std::vector<int64_t> &m_splits, bool accumulate = false,
+    const std::string &gemm_kind = "default");
+
 // with_swizzle=true makes K2 write rowwise scale_inv in the cuBLAS LT
 // swizzled tile layout (skips the standalone nvte_swizzle_scaling_factors).
 // Has no effect on colwise scale_inv (rowwise-only for now).
@@ -584,6 +597,19 @@ nvfp4_per_token_group_quantize_bulk(const at::Tensor &input,
                                     bool with_swizzle, bool do_amax,
                                     const std::optional<at::Tensor> &row_amax,
                                     const std::optional<at::Tensor> &col_amax);
+
+// Dense twin of nvfp4_per_token_group_quantize_bulk: returns concatenated
+// buffers (q_row, s_dec_row_fp8, row_amax, q_col, s_dec_col_fp8, col_amax)
+// with no per-expert aten::narrow. Disabled directions return undefined/empty
+// tensors. Prefer this with nvfp4_cutlass_grouped_per_token_gemm_dense.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+nvfp4_per_token_group_quantize_bulk_dense(const at::Tensor &input,
+                                          const std::vector<int64_t> &split_sections, bool rowwise,
+                                          bool columnwise, bool with_rht,
+                                          int64_t random_sign_mask_t, bool with_swizzle,
+                                          bool do_amax,
+                                          const std::optional<at::Tensor> &row_amax,
+                                          const std::optional<at::Tensor> &col_amax);
 
 /***************************************************************************************************
  * Rotary positional embedding
