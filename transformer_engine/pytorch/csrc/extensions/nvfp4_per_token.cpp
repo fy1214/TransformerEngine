@@ -16,7 +16,6 @@
 #include <vector>
 
 #include "../extensions.h"
-#include "common/util/system.h"
 
 namespace transformer_engine::pytorch {
 
@@ -802,17 +801,10 @@ BulkQuantizeDenseOut run_nvfp4_per_token_group_quantize_bulk_dense_impl(
   // Empty experts (M_i == 0) are allowed: MoE token packs omit those rows, and
   // the grouped kernel already skips zero splits (see populate_args). Non-zero
   // splits must still be multiples of the per-token tile (128).
-  // Set NVTE_NVFP4_DENSE_REJECT_EMPTY=1 to restore the legacy "all M_i > 0" assert
-  // for before/after bitwise compare harnesses.
-  const bool reject_empty =
-      transformer_engine::getenv<bool>("NVTE_NVFP4_DENSE_REJECT_EMPTY", false);
   int64_t acc = 0;
   for (size_t i = 0; i < num_tensors; ++i) {
     const int64_t M_i = split_sections[i];
     TORCH_CHECK(M_i >= 0, "split_sections[", i, "] must be >= 0, got ", M_i);
-    if (reject_empty) {
-      TORCH_CHECK(M_i > 0, "split_sections[", i, "] must be > 0, got ", M_i);
-    }
     TORCH_CHECK(M_i % kPerTokenTile == 0, "split_sections[", i, "] = ", M_i,
                 " must be a multiple of ", kPerTokenTile);
     acc += M_i;

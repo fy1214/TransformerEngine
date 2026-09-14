@@ -1085,15 +1085,9 @@ void nvte_nvfp4_cutlass_grouped_per_token_gemm_dense(
 
   std::vector<int> Ms(num_groups), Ns(num_groups, N), Ks(num_groups, K);
   int64_t acc_M = 0;
-  // Empty experts allowed unless NVTE_NVFP4_DENSE_REJECT_EMPTY=1 (legacy compare).
-  const bool reject_empty =
-      transformer_engine::getenv<bool>("NVTE_NVFP4_DENSE_REJECT_EMPTY", false);
   for (int g = 0; g < num_groups; ++g) {
     Ms[g] = static_cast<int>(m_splits[g]);
     NVTE_CHECK(Ms[g] >= 0, "m_splits[", g, "] must be >= 0");
-    if (reject_empty) {
-      NVTE_CHECK(Ms[g] > 0, "m_splits[", g, "] must be > 0");
-    }
     acc_M += Ms[g];
   }
   NVTE_CHECK(acc_M == sum_M, "sum(m_splits)=", acc_M, " must equal A.size(0)=", sum_M);

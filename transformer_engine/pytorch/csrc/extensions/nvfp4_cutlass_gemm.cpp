@@ -8,7 +8,6 @@
 #include <transformer_engine/swizzle.h>
 
 #include "../extensions.h"
-#include "common/util/system.h"
 
 namespace transformer_engine::pytorch {
 
@@ -236,7 +235,6 @@ void nvfp4_cutlass_per_token_gemm(const at::Tensor &a_data, const at::Tensor &b_
 // entry points above) unless the corresponding *_sf_swizzled flag is set.
 // Empty experts (M_g == 0) are allowed: they keep weight slots in the packed B
 // but are dropped from the CUTLASS problem list inside the dense launch.
-// Set NVTE_NVFP4_DENSE_REJECT_EMPTY=1 to restore the legacy all-positive assert.
 namespace {
 
 NVTENvfp4GroupedGemmKind parse_nvfp4_grouped_gemm_kind(const std::string &s) {
@@ -473,14 +471,8 @@ void nvfp4_cutlass_grouped_per_token_gemm_dense(
 
   std::vector<int32_t> m_splits_i32(static_cast<size_t>(G));
   int64_t acc = 0;
-  // Legacy compare harness: NVTE_NVFP4_DENSE_REJECT_EMPTY=1 restores all-positive.
-  const bool reject_empty =
-      transformer_engine::getenv<bool>("NVTE_NVFP4_DENSE_REJECT_EMPTY", false);
   for (int64_t g = 0; g < G; ++g) {
     TORCH_CHECK(m_splits[g] >= 0, "m_splits[", g, "] must be >= 0");
-    if (reject_empty) {
-      TORCH_CHECK(m_splits[g] > 0, "m_splits[", g, "] must be > 0");
-    }
     m_splits_i32[static_cast<size_t>(g)] = static_cast<int32_t>(m_splits[g]);
     acc += m_splits[g];
   }
