@@ -335,10 +335,16 @@ static bool use_batched_h2d() {
 
 static bool all_aligned_256(const std::vector<int>& xs) {
   if (xs.empty()) return false;
+  bool saw_nonzero = false;
   for (int x : xs) {
+    // Empty experts (M==0) are skipped from the CUTLASS launch; ignore them for
+    // alternate-tile predicates so dense MoE packs with holes still select tiles
+    // based on the active groups.
+    if (x == 0) continue;
+    saw_nonzero = true;
     if (x % 256 != 0) return false;
   }
-  return true;
+  return saw_nonzero;
 }
 
 // Alternate-tile predicate: RequiredKind + which extents must be 256-aligned.
@@ -651,39 +657,44 @@ __global__ void fill_grouped_per_token_dense_args_kernel(
     const void* b_base, const void* sfa_base, const void* sfb_base, void* d_base,
     const float* alpha_a_base, const float* alpha_b_base, const int32_t* a_row_offsets,
     const int32_t* b_row_offsets, const int64_t* a_sf_offsets, const int64_t* b_sf_offsets,
-    int K_packed, int K, int N) {
-  const int g = static_cast<int>(threadIdx.x);
+    int K_packed, int K, int N, const int32_t* active_experts, int num_launch_groups) {
+  const int slot = static_cast<int>(threadIdx.x);
+  if (slot >= num_launch_groups) return;
+  // active_experts == nullptr => identity mapping (no empty experts).
+  const int g = (active_experts != nullptr) ? active_experts[slot] : slot;
   const int M_g = a_row_offsets[g + 1] - a_row_offsets[g];
   const int N_g = b_row_offsets[g + 1] - b_row_offsets[g];
 
   // A/B stored as packed FP4 uint8 rows of length K_packed = K/2.
-  ptr_A[g] = reinterpret_cast<const ElementADataT*>(
+  ptr_A[slot] = reinterpret_cast<const ElementADataT*>(
       static_cast<const char*>(a_base) + static_cast<int64_t>(a_row_offsets[g]) * K_packed);
-  ptr_B[g] = reinterpret_cast<const ElementBDataT*>(
+  ptr_B[slot] = reinterpret_cast<const ElementBDataT*>(
       static_cast<const char*>(b_base) + static_cast<int64_t>(b_row_offsets[g]) * K_packed);
-  ptr_SFA[g] = static_cast<const ElementSFT*>(sfa_base) + a_sf_offsets[g];
-  ptr_SFB[g] = static_cast<const ElementSFT*>(sfb_base) + b_sf_offsets[g];
-  ptr_D[g] = reinterpret_cast<ElementDT*>(
+  ptr_SFA[slot] = static_cast<const ElementSFT*>(sfa_base) + a_sf_offsets[g];
+  ptr_SFB[slot] = static_cast<const ElementSFT*>(sfb_base) + b_sf_offsets[g];
+  ptr_D[slot] = reinterpret_cast<ElementDT*>(
       static_cast<char*>(d_base) +
       static_cast<int64_t>(a_row_offsets[g]) * N * static_cast<int>(sizeof(ElementDT)));
-  ptr_alpha_a[g] = alpha_a_base + a_row_offsets[g];
-  ptr_alpha_b[g] = alpha_b_base + b_row_offsets[g];
+  ptr_alpha_a[slot] = alpha_a_base + a_row_offsets[g];
+  ptr_alpha_b[slot] = alpha_b_base + b_row_offsets[g];
 
-  stride_A[g] = cutlass::make_cute_packed_stride(StrideAT{}, {M_g, K, 1});
-  stride_B[g] = cutlass::make_cute_packed_stride(StrideBT{}, {N_g, K, 1});
-  stride_C[g] = cutlass::make_cute_packed_stride(StrideCT{}, {M_g, N_g, 1});
-  stride_D[g] = cutlass::make_cute_packed_stride(StrideDT{}, {M_g, N_g, 1});
+  stride_A[slot] = cutlass::make_cute_packed_stride(StrideAT{}, {M_g, K, 1});
+  stride_B[slot] = cutlass::make_cute_packed_stride(StrideBT{}, {N_g, K, 1});
+  stride_C[slot] = cutlass::make_cute_packed_stride(StrideCT{}, {M_g, N_g, 1});
+  stride_D[slot] = cutlass::make_cute_packed_stride(StrideDT{}, {M_g, N_g, 1});
 
   auto shape_g = cute_::make_shape(M_g, N_g, K, 1);
-  layout_SFA[g] = BlkCfgT::tile_atom_to_shape_SFA(shape_g);
-  layout_SFB[g] = BlkCfgT::tile_atom_to_shape_SFB(shape_g);
-  problem_sizes[g] = cute_::make_shape(M_g, N_g, K);
+  layout_SFA[slot] = BlkCfgT::tile_atom_to_shape_SFA(shape_g);
+  layout_SFB[slot] = BlkCfgT::tile_atom_to_shape_SFB(shape_g);
+  problem_sizes[slot] = cute_::make_shape(M_g, N_g, K);
 }
 
 // Dense launch: device fill of ptr-array metadata, then same Gemm as list path.
 // Requires uniform N across groups (encoded in D.size(1) / Ns[0]). No bias.
 // Prefix offset tables (a_row/b_row/a_sf/b_sf) are built on device from host Ms
 // when the caller passes nullptr; otherwise the provided device tables are used.
+// Empty experts (Ms[g] == 0) keep their weight slots in the G*N B pack but are
+// dropped from the CUTLASS problem list (same semantics as the list GEMM path).
 template <bool Accumulate, class OverwriteGemmT = Gemm, class OverwriteEVTT = FusedEVT,
           int ClusterM = 1>
 static void run_cutlass_grouped_per_token_gemm_dense_impl(
@@ -707,12 +718,22 @@ static void run_cutlass_grouped_per_token_gemm_dense_impl(
   NVTE_CHECK(K > 0 && (K % 2) == 0, "K must be positive and even (FP4 packed), got ", K);
   NVTE_CHECK((K % 16) == 0, "K must be a multiple of 16 for SF packing, got ", K);
   const int N = Ns[0];
+  std::vector<int32_t> active_experts;
+  active_experts.reserve(static_cast<size_t>(G));
   for (int g = 0; g < G; ++g) {
     NVTE_CHECK(Ns[g] == N, "dense grouped GEMM requires uniform N across groups; Ns[0]=", N,
                " Ns[", g, "]=", Ns[g]);
-    NVTE_CHECK(Ms[g] > 0 && Ms[g] % 128 == 0 && Ns[g] % 128 == 0 && K % 128 == 0,
-               "group ", g, ": M/N/K must be positive multiples of 128");
+    NVTE_CHECK(Ms[g] >= 0, "m_splits[", g, "] must be >= 0");
+    if (Ms[g] == 0) continue;
+    NVTE_CHECK(Ms[g] % 128 == 0 && Ns[g] % 128 == 0 && K % 128 == 0,
+               "group ", g, ": non-empty M/N/K must be multiples of 128");
+    active_experts.push_back(static_cast<int32_t>(g));
   }
+  const int G_launch = static_cast<int>(active_experts.size());
+  if (G_launch == 0) {
+    return;
+  }
+  const bool has_empty = (G_launch != G);
   const int K_packed = K / 2;
   const int k_sf = K / 16;
 
@@ -722,22 +743,22 @@ static void run_cutlass_grouped_per_token_gemm_dense_impl(
                               a_sf_offsets == nullptr && b_sf_offsets == nullptr),
              "dense grouped GEMM offsets must be all provided or all nullptr");
 
-  // Persistent device scratch — filled by the kernels below (no H2D of ptr tables).
   const size_t need =
-      align256(static_cast<size_t>(G) * sizeof(typename ProblemShape::UnderlyingProblemShape)) +
-      align256(static_cast<size_t>(G) * sizeof(StrideAT)) +
-      align256(static_cast<size_t>(G) * sizeof(StrideBT)) +
-      align256(static_cast<size_t>(G) * sizeof(StrideCT)) +
-      align256(static_cast<size_t>(G) * sizeof(StrideDT)) +
-      align256(static_cast<size_t>(G) * sizeof(LayoutSFAT)) +
-      align256(static_cast<size_t>(G) * sizeof(LayoutSFBT)) +
-      align256(static_cast<size_t>(G) * sizeof(const ElementADataT*)) +
-      align256(static_cast<size_t>(G) * sizeof(const ElementBDataT*)) +
-      align256(static_cast<size_t>(G) * sizeof(const ElementSFT*)) +
-      align256(static_cast<size_t>(G) * sizeof(const ElementSFT*)) +
-      align256(static_cast<size_t>(G) * sizeof(ElementDT*)) +
-      align256(static_cast<size_t>(G) * sizeof(const float*)) +
-      align256(static_cast<size_t>(G) * sizeof(const float*)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(typename ProblemShape::UnderlyingProblemShape)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(StrideAT)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(StrideBT)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(StrideCT)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(StrideDT)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(LayoutSFAT)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(LayoutSFBT)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(const ElementADataT*)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(const ElementBDataT*)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(const ElementSFT*)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(const ElementSFT*)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(ElementDT*)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(const float*)) +
+      align256(static_cast<size_t>(G_launch) * sizeof(const float*)) +
+      (has_empty ? align256(static_cast<size_t>(G_launch) * sizeof(int32_t)) : 0) +
       (need_prefix
            ? (align256(static_cast<size_t>(G) * sizeof(int32_t)) +
               align256(static_cast<size_t>(G + 1) * sizeof(int32_t)) +
@@ -754,26 +775,39 @@ static void run_cutlass_grouped_per_token_gemm_dense_impl(
   };
   auto* problems_d =
       static_cast<typename ProblemShape::UnderlyingProblemShape*>(take(
-          static_cast<size_t>(G) * sizeof(typename ProblemShape::UnderlyingProblemShape)));
-  auto* stride_A_d = static_cast<StrideAT*>(take(static_cast<size_t>(G) * sizeof(StrideAT)));
-  auto* stride_B_d = static_cast<StrideBT*>(take(static_cast<size_t>(G) * sizeof(StrideBT)));
-  auto* stride_C_d = static_cast<StrideCT*>(take(static_cast<size_t>(G) * sizeof(StrideCT)));
-  auto* stride_D_d = static_cast<StrideDT*>(take(static_cast<size_t>(G) * sizeof(StrideDT)));
-  auto* layout_SFA_d = static_cast<LayoutSFAT*>(take(static_cast<size_t>(G) * sizeof(LayoutSFAT)));
-  auto* layout_SFB_d = static_cast<LayoutSFBT*>(take(static_cast<size_t>(G) * sizeof(LayoutSFBT)));
-  auto* a_ptr_d =
-      static_cast<const ElementADataT**>(take(static_cast<size_t>(G) * sizeof(const ElementADataT*)));
-  auto* b_ptr_d =
-      static_cast<const ElementBDataT**>(take(static_cast<size_t>(G) * sizeof(const ElementBDataT*)));
-  auto* sfa_ptr_d =
-      static_cast<const ElementSFT**>(take(static_cast<size_t>(G) * sizeof(const ElementSFT*)));
-  auto* sfb_ptr_d =
-      static_cast<const ElementSFT**>(take(static_cast<size_t>(G) * sizeof(const ElementSFT*)));
-  auto* d_ptr_d = static_cast<ElementDT**>(take(static_cast<size_t>(G) * sizeof(ElementDT*)));
+          static_cast<size_t>(G_launch) * sizeof(typename ProblemShape::UnderlyingProblemShape)));
+  auto* stride_A_d = static_cast<StrideAT*>(take(static_cast<size_t>(G_launch) * sizeof(StrideAT)));
+  auto* stride_B_d = static_cast<StrideBT*>(take(static_cast<size_t>(G_launch) * sizeof(StrideBT)));
+  auto* stride_C_d = static_cast<StrideCT*>(take(static_cast<size_t>(G_launch) * sizeof(StrideCT)));
+  auto* stride_D_d = static_cast<StrideDT*>(take(static_cast<size_t>(G_launch) * sizeof(StrideDT)));
+  auto* layout_SFA_d =
+      static_cast<LayoutSFAT*>(take(static_cast<size_t>(G_launch) * sizeof(LayoutSFAT)));
+  auto* layout_SFB_d =
+      static_cast<LayoutSFBT*>(take(static_cast<size_t>(G_launch) * sizeof(LayoutSFBT)));
+  auto* a_ptr_d = static_cast<const ElementADataT**>(
+      take(static_cast<size_t>(G_launch) * sizeof(const ElementADataT*)));
+  auto* b_ptr_d = static_cast<const ElementBDataT**>(
+      take(static_cast<size_t>(G_launch) * sizeof(const ElementBDataT*)));
+  auto* sfa_ptr_d = static_cast<const ElementSFT**>(
+      take(static_cast<size_t>(G_launch) * sizeof(const ElementSFT*)));
+  auto* sfb_ptr_d = static_cast<const ElementSFT**>(
+      take(static_cast<size_t>(G_launch) * sizeof(const ElementSFT*)));
+  auto* d_ptr_d =
+      static_cast<ElementDT**>(take(static_cast<size_t>(G_launch) * sizeof(ElementDT*)));
   auto* alpha_a_d =
-      static_cast<const float**>(take(static_cast<size_t>(G) * sizeof(const float*)));
+      static_cast<const float**>(take(static_cast<size_t>(G_launch) * sizeof(const float*)));
   auto* alpha_b_d =
-      static_cast<const float**>(take(static_cast<size_t>(G) * sizeof(const float*)));
+      static_cast<const float**>(take(static_cast<size_t>(G_launch) * sizeof(const float*)));
+
+  const int32_t* active_experts_d = nullptr;
+  if (has_empty) {
+    auto* active_scratch =
+        static_cast<int32_t*>(take(static_cast<size_t>(G_launch) * sizeof(int32_t)));
+    NVTE_CHECK_CUDA(cudaMemcpyAsync(active_scratch, active_experts.data(),
+                                    static_cast<size_t>(G_launch) * sizeof(int32_t),
+                                    cudaMemcpyHostToDevice, stream));
+    active_experts_d = active_scratch;
+  }
 
   const int32_t* a_row_d = a_row_offsets;
   const int32_t* b_row_d = b_row_offsets;
@@ -803,11 +837,11 @@ static void run_cutlass_grouped_per_token_gemm_dense_impl(
 
   fill_grouped_per_token_dense_args_kernel<StrideAT, StrideBT, StrideCT, StrideDT, LayoutSFAT,
                                            LayoutSFBT, BlkCfgT, ElementDT>
-      <<<1, G, 0, stream>>>(a_ptr_d, b_ptr_d, sfa_ptr_d, sfb_ptr_d, d_ptr_d, alpha_a_d, alpha_b_d,
-                            stride_A_d, stride_B_d, stride_C_d, stride_D_d, layout_SFA_d,
-                            layout_SFB_d, problems_d, a_base, b_base, a_sf_base, b_sf_base, d_base,
-                            alpha_a_base, alpha_b_base, a_row_d, b_row_d, a_sf_d, b_sf_d, K_packed,
-                            K, N);
+      <<<1, G_launch, 0, stream>>>(
+          a_ptr_d, b_ptr_d, sfa_ptr_d, sfb_ptr_d, d_ptr_d, alpha_a_d, alpha_b_d, stride_A_d,
+          stride_B_d, stride_C_d, stride_D_d, layout_SFA_d, layout_SFB_d, problems_d, a_base,
+          b_base, a_sf_base, b_sf_base, d_base, alpha_a_base, alpha_b_base, a_row_d, b_row_d,
+          a_sf_d, b_sf_d, K_packed, K, N, active_experts_d, G_launch);
   NVTE_CHECK_CUDA(cudaGetLastError());
 
   cutlass::KernelHardwareInfo hw_info;
@@ -829,23 +863,23 @@ static void run_cutlass_grouped_per_token_gemm_dense_impl(
     auto* c_ptr_d = reinterpret_cast<const ElementCAcc**>(reinterpret_cast<void*>(d_ptr_d));
     typename GemmT::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        {G, problems_d, /*host_problem_shapes=*/nullptr},
+        {G_launch, problems_d, /*host_problem_shapes=*/nullptr},
         {a_ptr_d, stride_A_d, b_ptr_d, stride_B_d, sfa_ptr_d, layout_SFA_d, sfb_ptr_d,
          layout_SFB_d},
         {fusion_args, /*ptr_C=*/c_ptr_d, stride_C_d, d_ptr_d, stride_D_d},
         hw_info};
-    run_grouped_gemm(gemm, args, G, stream);
+    run_grouped_gemm(gemm, args, G_launch, stream);
   } else {
     typename OverwriteEVTT::Arguments fusion_args =
         make_z_args<typename OverwriteEVTT::Arguments>(alpha_a_d, alpha_b_d);
     typename GemmT::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        {G, problems_d, /*host_problem_shapes=*/nullptr},
+        {G_launch, problems_d, /*host_problem_shapes=*/nullptr},
         {a_ptr_d, stride_A_d, b_ptr_d, stride_B_d, sfa_ptr_d, layout_SFA_d, sfb_ptr_d,
          layout_SFB_d},
         {fusion_args, /*ptr_C=*/nullptr, stride_C_d, d_ptr_d, stride_D_d},
         hw_info};
-    run_grouped_gemm(gemm, args, G, stream);
+    run_grouped_gemm(gemm, args, G_launch, stream);
   }
 }
 
@@ -1051,9 +1085,15 @@ void nvte_nvfp4_cutlass_grouped_per_token_gemm_dense(
 
   std::vector<int> Ms(num_groups), Ns(num_groups, N), Ks(num_groups, K);
   int64_t acc_M = 0;
+  // Empty experts allowed unless NVTE_NVFP4_DENSE_REJECT_EMPTY=1 (legacy compare).
+  const bool reject_empty =
+      transformer_engine::getenv<bool>("NVTE_NVFP4_DENSE_REJECT_EMPTY", false);
   for (int g = 0; g < num_groups; ++g) {
     Ms[g] = static_cast<int>(m_splits[g]);
-    NVTE_CHECK(Ms[g] > 0, "m_splits[", g, "] must be > 0");
+    NVTE_CHECK(Ms[g] >= 0, "m_splits[", g, "] must be >= 0");
+    if (reject_empty) {
+      NVTE_CHECK(Ms[g] > 0, "m_splits[", g, "] must be > 0");
+    }
     acc_M += Ms[g];
   }
   NVTE_CHECK(acc_M == sum_M, "sum(m_splits)=", acc_M, " must equal A.size(0)=", sum_M);
