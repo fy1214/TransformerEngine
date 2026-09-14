@@ -798,10 +798,13 @@ BulkQuantizeDenseOut run_nvfp4_per_token_group_quantize_bulk_dense_impl(
   TORCH_CHECK(num_tensors <= 64, "num_tensors must be <= 64 (kernel arg-struct cap); got ",
               num_tensors);
 
+  // Empty experts (M_i == 0) are allowed: MoE token packs omit those rows, and
+  // the grouped kernel already skips zero splits (see populate_args). Non-zero
+  // splits must still be multiples of the per-token tile (128).
   int64_t acc = 0;
   for (size_t i = 0; i < num_tensors; ++i) {
     const int64_t M_i = split_sections[i];
-    TORCH_CHECK(M_i > 0, "split_sections[", i, "] must be > 0, got ", M_i);
+    TORCH_CHECK(M_i >= 0, "split_sections[", i, "] must be >= 0, got ", M_i);
     TORCH_CHECK(M_i % kPerTokenTile == 0, "split_sections[", i, "] = ", M_i,
                 " must be a multiple of ", kPerTokenTile);
     acc += M_i;
@@ -879,6 +882,12 @@ BulkQuantizeDenseOut run_nvfp4_per_token_group_quantize_bulk_dense_impl(
     const int64_t M_i = split_sections[i];
     split_sections_sz[i] = static_cast<size_t>(M_i);
     wrappers.emplace_back(NVTE_NVFP4_1D_SCALING);
+    if (M_i == 0) {
+      // Mirror non-bulk nvfp4_per_token_group_quantize: empty split is skipped
+      // inside the grouped kernel; do not wire output buffer pointers.
+      handles.push_back(wrappers.back().data());
+      continue;
+    }
     void* q_row_i =
         rowwise ? static_cast<void*>(q_row_base + m_off * (K / 2)) : nullptr;
     void* s_row_i =
