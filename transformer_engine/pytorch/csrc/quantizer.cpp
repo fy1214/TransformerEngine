@@ -1931,10 +1931,13 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::create_tensor(
   const std::vector<int64_t> shape_int64(shape.begin(), shape.end());
   const auto [flat_first_dim, flat_last_dim] = get_2d_dims(shape);
 
-  // Swizzled SF is only valid when the RHT cast-fusion path runs;
-  // other quantize paths reject it.
-  const bool with_gemm_swizzled_scales = this->optimize_for_gemm && this->with_rht &&
-                                         NVFP4Quantizer::is_eligible_for_rht_cast_fusion(shape);
+  // Must mirror exactly which kernels in quantize_impl() emit swizzled scale
+  // factors. This attribute is what the GEMM reads to interpret the SF array,
+  // so a gate narrower than the dispatch silently mis-decodes every block.
+  const bool with_gemm_swizzled_scales =
+      this->optimize_for_gemm &&
+      ((this->per_token && !this->per_token_weight_2d) ||
+       (this->with_rht && NVFP4Quantizer::is_eligible_for_rht_cast_fusion(shape)));
   NVTE_CHECK(flat_first_dim % NVFP4_BLOCK_SIZE == 0, "First dim for NVFP4 must be divisible by ",
              NVFP4_BLOCK_SIZE, " (got shape=", shape, ")");
   NVTE_CHECK(flat_last_dim % NVFP4_BLOCK_SIZE == 0,
@@ -2279,10 +2282,13 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::convert_and_update_tensor(
 
   const auto [flat_first_dim, flat_last_dim] = get_2d_dims(shape);
 
-  // Swizzled SF is only valid when the RHT cast-fusion path runs;
-  // other quantize paths reject it.
-  const bool with_gemm_swizzled_scales = this->optimize_for_gemm && this->with_rht &&
-                                         NVFP4Quantizer::is_eligible_for_rht_cast_fusion(shape);
+  // Must mirror exactly which kernels in quantize_impl() emit swizzled scale
+  // factors. This attribute is what the GEMM reads to interpret the SF array,
+  // so a gate narrower than the dispatch silently mis-decodes every block.
+  const bool with_gemm_swizzled_scales =
+      this->optimize_for_gemm &&
+      ((this->per_token && !this->per_token_weight_2d) ||
+       (this->with_rht && NVFP4Quantizer::is_eligible_for_rht_cast_fusion(shape)));
 
   const bool row_scaled_nvfp4 = this->row_scaled_nvfp4;
   const bool nvfp4_use_4over6 = this->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled;
@@ -2637,6 +2643,14 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
     }
     const bool with_swizzle = this->optimize_for_gemm;
     if (with_swizzle) {
+      // set_with_gemm_swizzled_scales() only reaches this transient wrapper, not the
+      // Python tensor the GEMM inspects, so the layout the caller already advertised
+      // is the one that counts. Fail loudly rather than emit a mislabelled SF array.
+      NVTE_CHECK(out.get_with_gemm_swizzled_scales(),
+                 "NVFP4 per-token cast is about to emit GEMM-swizzled scale factors, but the "
+                 "output tensor was created advertising linear ones. The with_gemm_swizzled_scales "
+                 "gate in create_tensor()/convert_and_update_tensor() is out of sync with this "
+                 "dispatch.");
       out.set_with_gemm_swizzled_scales(true);
     }
     NVTE_SCOPED_GIL_RELEASE({
